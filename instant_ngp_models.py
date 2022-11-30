@@ -2,8 +2,12 @@ import taichi as ti
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from stannum import Tin
-from taichi.math import ivec2, vec2, ivec3
+from taichi.math import ivec2, ivec3
+from math_utils import ray_aabb_intersection
+from instant_ngp_utils import SHEncoder
 
 torch_device = torch.device("cuda:0")
 
@@ -217,3 +221,80 @@ class MLP(nn.Module):
         color = self.color_net(color_input)
         return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
+
+@ti.kernel
+def gen_samples(x : ti.types.ndarray(element_dim=1),
+                pos_query : ti.types.ndarray(element_dim=1),
+                view_dirs : ti.types.ndarray(element_dim=1),
+                dists : ti.types.ndarray(),
+                n_samples : ti.i32, batch_size : ti.i32):
+  for i in range(batch_size):
+    vec = x[i]
+    ray_origin = ti.Vector([vec[0], vec[1], vec[2]])
+    ray_dir = ti.Vector([vec[3], vec[4], vec[5]]).normalized()
+    isect, near, far = ray_aabb_intersection(ti.Vector([-1.5, -1.5, -1.5]), ti.Vector([1.5, 1.5, 1.5]), ray_origin, ray_dir)
+    if not isect:
+      near = 2.0
+      far = 6.0
+    for j in range(n_samples):
+      d = near + (far - near) / ti.cast(n_samples, ti.f32) * (ti.cast(j, ti.f32) + ti.random())
+      pos_query[j, i] = ray_origin + ray_dir * d
+      view_dirs[j, i] = ray_dir
+      dists[j, i] = d
+    for j in range(n_samples - 1):
+      dists[j, i] = dists[j + 1, i] - dists[j, i]
+    dists[n_samples - 1, i] = 1e10
+
+
+class NerfDriver(nn.Module):
+    def __init__(self, batch_size, N_max):
+        super(NerfDriver, self).__init__()
+        self.mlp = MLP(batch_size=batch_size, N_max=N_max)
+        self.dir_encoder = SHEncoder()
+
+    def query(self, input, mlp : MLP):
+        out = mlp(input)
+        color, density = out[:, :3], out[:, -1]
+        return density, color
+    
+    def composite(self, density, color, dists, samples, batch_size):
+        # density = density.reshape(samples, batch_size)
+        density = torch.unsqueeze(density, 0).repeat(samples, 1)
+        # color = color.reshape(samples, batch_size, 3)
+        color = torch.unsqueeze(color, 0).repeat(samples, 1, 1)
+
+        # print("density shape ", density.shape, " color shape ", color.shape)
+        # Convert density to alpha
+        alpha = 1.0 - torch.exp(-F.relu(density) * dists)
+        # Composite
+        weight = alpha * torch.cumprod(1.0 - alpha + 1e-10, dim=0)
+
+        color = color * weight[:,:,None]
+        return color.sum(dim=0)
+
+    def forward(self, x):
+        # x [batch, (pos, dir)]
+        pos, dir = x[:, :3], x[:, 3:]
+        batch_size = x.shape[0]
+        samples = 128
+        pos_query = torch.Tensor(size=(samples, x.shape[0], 3)).to(torch_device)
+        view_dir = torch.Tensor(size=(samples, x.shape[0], 3)).to(torch_device)
+        dists = torch.Tensor(size=(samples, x.shape[0])).to(torch_device)
+
+        gen_samples(x, pos_query, view_dir, dists, samples, batch_size)
+        ti.sync()
+        torch.cuda.synchronize(device=None)
+        
+        encoded_dir = self.dir_encoder(dir)
+        # print("pos, encoded dir ", pos.shape, " ", encoded_dir.shape)
+        input = torch.cat([pos, encoded_dir], dim=1)
+        # print("input to the network shape ", input.shape)
+        # Query fine model
+        density, color = self.query(input, self.mlp)
+        # print("density ", density.shape, " color ", color.shape)
+        output = self.composite(density, color, dists, samples, batch_size)
+
+        return output
+    
+    def update_ti_modules(self, lr):
+        self.mlp.update_ti_modules(lr)

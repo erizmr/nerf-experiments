@@ -1,19 +1,15 @@
 import taichi as ti
 import numpy as np
 import json
-from instant_ngp_models import MLP
+from instant_ngp_models import NerfDriver
 # from torch.utils.tensorboard import SummaryWriter
 
 import torch
-from math_utils import ray_aabb_intersection
-from instant_ngp_utils import SHEncoder
 
 ti.init(arch=ti.cuda, device_memory_GB=2)
 
 def loss_fn(X, Y):
-      L = (X - Y) * (X - Y)
-      return L.sum()
-      # return F.mse_loss(X, Y)
+      return torch.mean((X-Y)**2)
 
 set_name = "nerf_synthetic"
 scene_name = "lego"
@@ -21,8 +17,8 @@ downscale = 2
 image_w = 800.0 / downscale
 image_h = 800.0 / downscale
 
-BATCH_SIZE=2 << 18
-BATCH_SIZE=4096
+BATCH_SIZE = 2 << 18
+BATCH_SIZE = int(image_w * image_h)
 learning_rate = 1e-3
 n_iters = 10000
 optimizer_fn = torch.optim.Adam
@@ -106,35 +102,10 @@ desc = load_desc_from_json(set_name + "/" + scene_name + "/transforms_train.json
 desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.json")
 
 
-@ti.kernel
-def gen_samples(x : ti.types.ndarray(element_dim=1),
-                pos_query : ti.types.ndarray(element_dim=1),
-                view_dirs : ti.types.ndarray(element_dim=1),
-                dists : ti.types.ndarray(),
-                n_samples : ti.i32, batch_size : ti.i32):
-  for i in range(batch_size):
-    vec = x[i]
-    ray_origin = ti.Vector([vec[0], vec[1], vec[2]])
-    ray_dir = ti.Vector([vec[3], vec[4], vec[5]]).normalized()
-    isect, near, far = ray_aabb_intersection(ti.Vector([-1.5, -1.5, -1.5]), ti.Vector([1.5, 1.5, 1.5]), ray_origin, ray_dir)
-    if not isect:
-      near = 2.0
-      far = 6.0
-    for j in range(n_samples):
-      d = near + (far - near) / ti.cast(n_samples, ti.f32) * (ti.cast(j, ti.f32) + ti.random())
-      pos_query[j, i] = ray_origin + ray_dir * d
-      view_dirs[j, i] = ray_dir
-      dists[j, i] = d
-    for j in range(n_samples - 1):
-      dists[j, i] = dists[j + 1, i] - dists[j, i]
-    dists[n_samples - 1, i] = 1e10
-
-
 device = "cuda"
 
 N_max = max(image_w, image_h) // 2
-model = MLP(batch_size=BATCH_SIZE, N_max=N_max)
-dir_encoder = SHEncoder()
+model = NerfDriver(batch_size=BATCH_SIZE, N_max=N_max)
 
 optimizer = optimizer_fn(model.parameters(), lr=learning_rate)
 scaler = torch.cuda.amp.GradScaler()
@@ -150,9 +121,9 @@ for i in range(len(desc["frames"])):
   ti.sync()
   X.append(input_data.to_torch().to(device).reshape(-1,6))
   Y.append(output_data.to_torch().to(device).reshape(-1,3))
-X = torch.vstack(X)
-Y = torch.vstack(Y)
-
+X = torch.stack(X, dim=0)
+Y = torch.stack(Y, dim=0)
+print("training data ", X.shape, " test data ", Y.shape)
 ti.imwrite(input_image, "input_full_sample.png")
 ti.imwrite(scaled_image, "input_sample.png")
 
@@ -162,8 +133,8 @@ torch.save(Y, "output_samples.th")
 # writer = SummaryWriter()
 
 indices = torch.randperm(X.shape[0])
-indices = torch.split(indices, BATCH_SIZE)
-
+# indices = torch.split(indices, BATCH_SIZE)
+print("indices ", indices)
 test_indicies = torch.randperm(len(desc_test["frames"]))
 
 for iter in range(n_iters):
@@ -172,20 +143,22 @@ for iter in range(n_iters):
   b = np.random.randint(0, len(indices))
   Xbatch = X[indices[b]]
   Ybatch = Y[indices[b]]
-  print("training sample ", Xbatch.shape)
+#   print("training sample ", Xbatch.shape)
   with torch.cuda.amp.autocast():
-    encoded_dir = dir_encoder(Xbatch[:, 3:])
-    pred = model(torch.cat([Xbatch[:, :3], encoded_dir], -1))
-    print("output shape ", pred.shape)
-    loss = loss_fn(pred[:,:3], Ybatch) * 0.1
+    pred = model(Xbatch)
+    # print("output shape ", pred.shape)
+    loss = loss_fn(pred, Ybatch)
   
   loss.backward()
   optimizer.step()
+  
+  model.update_ti_modules(lr = learning_rate)
+
   optimizer.zero_grad()
   accum_loss += loss.item()
 
   if iter % 10 == 9:
-    print(iter, b, "train loss=", accum_loss / 10)
+    print(iter, b, "train loss=", accum_loss)
     # writer.add_scalar('Loss/train', accum_loss / 10, iter)
     accum_loss = 0.0
 
@@ -197,23 +170,23 @@ for iter in range(n_iters):
         ti.sync()
         X_test = input_data.to_torch().to(device).reshape(-1,6)
         Y_test = output_data.to_torch().to(device).reshape(-1,3)
-
-        Xbatch = X_test.split(BATCH_SIZE)
-        Ybatch = Y_test.split(BATCH_SIZE)
-
+        # print("X test shape ", X_test.shape)
+        Xbatch_list = X_test.split(BATCH_SIZE)
+        Ybatch_list = Y_test.split(BATCH_SIZE)
+        # print("Xbatch list ", len(Xbatch_list))
         img_pred = []
 
-        for b in range(len(Xbatch)):
+        for b in range(len(Xbatch_list)):
           with torch.cuda.amp.autocast():
-            x = Xbatch[b]
-            if x.shape[0] == BATCH_SIZE:
-                encoded_dir = dir_encoder(x[:, 3:])
-                pred = model(torch.cat([x[:, :3], encoded_dir], -1))
-                loss = loss_fn(pred[:, :3], Ybatch[b])
-                img_pred.append(pred)
-                test_loss += loss.item()
-
+            Xbatch = Xbatch_list[b]
+            pred = model(Xbatch)
+            # print("pred shape ", pred.shape)
+            loss = loss_fn(pred, Ybatch_list[b])
+            img_pred.append(pred)
+            test_loss += loss.item()
+        # print("img pred shape before stack ", len(img_pred))
         img_pred = torch.vstack(img_pred)
+        # print("img pred shape ", img_pred.shape)
         img_pred = img_pred.cpu().detach().numpy()
         img_pred = img_pred.reshape((int(image_w), int(image_h), 3))
 
@@ -223,5 +196,5 @@ for iter in range(n_iters):
     #   writer.add_scalar('Loss/test', test_loss / 10.0, iter / 1000.0)
       print("test loss=", test_loss / 10.0)
 
-  if iter % 5000 == 0:
-    torch.save(model, "model_" + str(iter) + ".pth")
+#   if iter % 5000 == 0:
+#     torch.save(model, "model_" + str(iter) + ".pth")
