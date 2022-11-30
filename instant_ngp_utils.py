@@ -83,4 +83,4 @@ class SHEncoder(nn.Module):
                         result[..., 23] = self.C4[7] * xz * (xx - 3 * yy)
                         result[..., 24] = self.C4[8] * (xx * (xx - 3 * yy) - yy * (3 * xx - yy))
 
-        return 
+        return result

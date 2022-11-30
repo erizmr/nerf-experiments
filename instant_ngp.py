@@ -8,8 +8,6 @@ import torch
 from math_utils import ray_aabb_intersection
 from instant_ngp_utils import SHEncoder
 
-from stannum import Tin
-
 ti.init(arch=ti.cuda, device_memory_GB=2)
 
 def loss_fn(X, Y):
@@ -136,6 +134,7 @@ device = "cuda"
 
 N_max = max(image_w, image_h) // 2
 model = MLP(batch_size=BATCH_SIZE, N_max=N_max)
+dir_encoder = SHEncoder()
 
 optimizer = optimizer_fn(model.parameters(), lr=learning_rate)
 scaler = torch.cuda.amp.GradScaler()
@@ -175,7 +174,8 @@ for iter in range(n_iters):
   Ybatch = Y[indices[b]]
   print("training sample ", Xbatch.shape)
   with torch.cuda.amp.autocast():
-    pred = model(Xbatch)
+    encoded_dir = dir_encoder(Xbatch[:, 3:])
+    pred = model(torch.cat([Xbatch[:, :3], encoded_dir], -1))
     print("output shape ", pred.shape)
     loss = loss_fn(pred[:,:3], Ybatch) * 0.1
   
@@ -205,10 +205,13 @@ for iter in range(n_iters):
 
         for b in range(len(Xbatch)):
           with torch.cuda.amp.autocast():
-            pred = model(Xbatch[b])
-            loss = loss_fn(pred[:, :3], Ybatch[b])
-            img_pred.append(pred)
-            test_loss += loss.item()
+            x = Xbatch[b]
+            if x.shape[0] == BATCH_SIZE:
+                encoded_dir = dir_encoder(x[:, 3:])
+                pred = model(torch.cat([x[:, :3], encoded_dir], -1))
+                loss = loss_fn(pred[:, :3], Ybatch[b])
+                img_pred.append(pred)
+                test_loss += loss.item()
 
         img_pred = torch.vstack(img_pred)
         img_pred = img_pred.cpu().detach().numpy()

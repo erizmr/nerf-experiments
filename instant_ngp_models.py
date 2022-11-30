@@ -189,7 +189,7 @@ class MLP(nn.Module):
         self.sigma_net = nn.Sequential(*sigma_layers).to(torch_device)
 
         # Color net
-        color_input_size = 18 # 3 + 15
+        color_input_size = 32 # 16 + 16
         color_output_size = 3 # RGB
         color_layers.append(nn.Linear(color_input_size, hidden_size, bias=False))
         color_layers.append(nn.ReLU(inplace=True))
@@ -213,7 +213,7 @@ class MLP(nn.Module):
         input_pos, input_dir = x[:,:3], x[:,3:]
         out = self.sigma_net(input_pos)
         sigma, geo_feat = out[..., 0], out[..., 1:]
-        color_input = torch.cat([input_dir, geo_feat], dim=-1)
+        color_input = torch.cat([input_dir, out], dim=-1)
         color = self.color_net(color_input)
         return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
