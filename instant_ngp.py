@@ -1,60 +1,111 @@
 import taichi as ti
 import numpy as np
-
+import json
+from instant_ngp_models import MLP
 # from torch.utils.tensorboard import SummaryWriter
 
-from taichi.math import ivec2, vec2, ivec3
-# from msssim.pytorch_msssim import MS_SSIM
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from math_utils import ray_aabb_intersection
+from instant_ngp_utils import SHEncoder
 
 from stannum import Tin
 
 ti.init(arch=ti.cuda, device_memory_GB=2)
 
-learning_rate = 1e-3
-n_iters = 10000
+def loss_fn(X, Y):
+      L = (X - Y) * (X - Y)
+      return L.sum()
+      # return F.mse_loss(X, Y)
 
-np_img = ti.tools.imread("test.jpg").astype(np.single) / 255.0
-width = np_img.shape[0]
-height = np_img.shape[1]
-
-print(width, height)
+set_name = "nerf_synthetic"
+scene_name = "lego"
+downscale = 2
+image_w = 800.0 / downscale
+image_h = 800.0 / downscale
 
 BATCH_SIZE=2 << 18
+BATCH_SIZE=4096
+learning_rate = 1e-3
+n_iters = 10000
+optimizer_fn = torch.optim.Adam
 
-img = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
-img.from_numpy(np_img)
+input_image = ti.Vector.field((4), dtype=ti.f32, shape=(int(image_w) * downscale, int(image_h) * downscale))
+input_data = ti.Vector.field((6), dtype=ti.f32, shape=(int(image_w * image_h)))
+output_data = ti.Vector.field((3), dtype=ti.f32, shape=(int(image_w * image_h)))
+scaled_image = ti.Vector.field((4), dtype=ti.f32, shape=(int(image_w), int(image_h)))
 
-L = 8
-max_scale = 1
 
-beta1 = 0.9
-beta2 = 0.99
+def load_desc_from_json(filename):
+  f = open(filename, "r")
+  content = f.read()
+  decoded = json.loads(content)
+  print(len(decoded["frames"]), "images from", filename)
+  print("=", len(decoded["frames"]) * image_w * image_h, "samples")
+  return decoded
 
+# Assume Z is up?
+
+@ti.func
+def get_arg(dir_x : ti.f32, dir_y : ti.f32, dir_z : ti.f32):
+  theta = ti.atan2(dir_y, dir_x)
+  phi = ti.atan2(dir_z, ti.sqrt(dir_x * dir_x + dir_y * dir_y))
+  return theta, phi
+
+camera_mtx = ti.Vector.field(3, dtype=ti.f32, shape=(3))
+
+@ti.func
+def normalize(v):
+  return v / ti.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+
+@ti.func
+def dot(a, b):
+  return a.x * b.x + a.y * b.y + a.z * b.z
 
 @ti.kernel
-def ti_update_weights(weight : ti.template(), grad : ti.template(), lr : ti.f32):
-    for I in ti.grouped(weight):
-        weight[I] -= lr * grad[I]
+def image_to_data(
+  input_img : ti.template(),
+  scaled_image : ti.template(),
+  input : ti.template(),
+  output : ti.template(),
+  fov_w : ti.f32,
+  fov_h : ti.f32,
+  world_pos_x : ti.f32,
+  world_pos_y : ti.f32,
+  world_pos_z : ti.f32):
+  for i,j in scaled_image:
+    scaled_image[i, j] = ti.Vector([0.0, 0.0, 0.0, 0.0])
+  for i,j in input_img:
+    scaled_image[i // downscale, j // downscale] += input_img[i, j] / (downscale * downscale * 255)
+  for i,j in scaled_image:
+    uv = ti.Vector([(i + 0.5) / image_w, (j + 0.5) / image_h])
+    uv = uv * 2.0 - 1.0
+    l = ti.tan(fov_w * 0.5)
+    t = ti.tan(fov_h * 0.5)
+    uv.x *= l
+    uv.y *= t
+    view_dir = ti.Vector([uv.x, uv.y, -1.0])
+    world_dir = ti.Vector([
+      dot(camera_mtx[0], view_dir),
+      dot(camera_mtx[1], view_dir),
+      dot(camera_mtx[2], view_dir)])
+    input[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([world_pos_x, world_pos_y, world_pos_z, world_dir.x, world_dir.y, world_dir.z])
+    output[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([scaled_image[i, j].x, scaled_image[i, j].y, scaled_image[i, j].z])
 
-@ti.kernel
-def ti_update_weights(weight : ti.template(),
-                      grad : ti.template(), grad_1st_moments : ti.template(), grad_2nd_moments : ti.template(),
-                      lr : ti.f32, eps : ti.f32):
-    for I in ti.grouped(weight):
-        g = grad[I]
-        if any(g != 0.0):
-            m = beta1 * grad_1st_moments[I] + (1.0 - beta1) * g
-            v = beta2 * grad_2nd_moments[I] + (1.0 - beta2) * g * g
-            grad_1st_moments[I] = m
-            grad_2nd_moments[I] = v
-            m_hat = m / (1.0 - beta1)
-            v_hat = v / (1.0 - beta2)
-            weight[I] -= lr * m_hat / (ti.sqrt(v_hat) + eps)
+
+def generate_data(desc, i):
+  img = desc["frames"][i]
+  file_name = set_name + "/" + scene_name + "/" + img["file_path"] + ".png"
+  # print("loading", file_name)
+  npimg = ti.imread(file_name)
+  input_image.from_numpy(npimg)
+  mtx = np.array(img["transform_matrix"])
+  camera_mtx.from_numpy(mtx[:3,:3])
+  ray_o = mtx[:3,-1]
+  ti.sync()
+  image_to_data(input_image, scaled_image, input_data, output_data, float(desc["camera_angle_x"]), float(desc["camera_angle_x"]), ray_o[0], ray_o[1], ray_o[2])
+
+desc = load_desc_from_json(set_name + "/" + scene_name + "/transforms_train.json")
+desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.json")
 
 
 @ti.kernel
@@ -81,382 +132,93 @@ def gen_samples(x : ti.types.ndarray(element_dim=1),
     dists[n_samples - 1, i] = 1e10
 
 
-@ti.data_oriented
-class MultiResHashEncoding:
-    def __init__(self, dim=2) -> None:
-        self.dim = dim
-        self.input_positions = ti.Vector.field(self.dim, dtype=ti.f32, shape=(BATCH_SIZE), needs_grad=False)
-        self.grids = []
-        self.grids_1st_moment = []
-        self.grids_2nd_moment = []
+device = "cuda"
 
-        self.F = 2 # Number of feature dimensions per entry F = 2
-        self.N_max = max(width, height) // 2
-        self.N_min = 16
-        self.n_tables = 16
-        self.b = np.exp((np.log(self.N_max) - np.log(self.N_min)) / (self.n_tables - 1)) # Equation (3)
-        self.max_table_size = (2 << 16)
+N_max = max(image_w, image_h) // 2
+model = MLP(batch_size=BATCH_SIZE, N_max=N_max)
 
-        print("n_tables", self.n_tables)
-        self.table_sizes = []
-        self.N_l = []
-        self.n_params = 0
-        self.n_features = 0
-        self.max_direct_map_level = 0
-        for i in range(self.n_tables):
-            N_l = int(np.floor(self.N_min * (self.b ** i))) # Equation (2)
-            self.N_l.append(N_l)
-            table_size = min(self.max_table_size, N_l ** self.dim)
-            self.table_sizes.append(table_size)
-            if table_size == N_l ** self.dim:
-                self.max_direct_map_level = i
-                table_size = (N_l + 1) ** self.dim
-            print(f"level {i} resolution: {N_l} n_entries: {table_size}")
-            
-            self.grids.append(ti.Vector.field(self.F, dtype=ti.f32, shape=(table_size), needs_grad=True))
-            self.grids_1st_moment.append(ti.Vector.field(self.F, dtype=ti.f32, shape=(table_size)))
-            self.grids_2nd_moment.append(ti.Vector.field(self.F, dtype=ti.f32, shape=(table_size)))
-            self.n_features += self.F
-            self.n_params += self.F * table_size
-        self.encoded_positions = ti.field(dtype=ti.f32, shape=(BATCH_SIZE, self.n_features), needs_grad=True)
-        self.hashes = [1, 265443576, 805459861]
-        print(f"hash table #params: {self.n_params}")
-
-    @ti.kernel
-    def initialize(self):
-        for l in ti.static(range(L)):
-            for I in ti.grouped(self.grids[l]):
-                self.grids[l][I] = (ti.Vector([ti.random(), ti.random()]) * 2.0 - 1.0) * 1e-4
-
-    @ti.func
-    def spatial_hash(self, p, level : ti.template()):
-        hash = 0
-        if ti.static(level <= self.max_direct_map_level):
-            hash = p.y * self.N_l[level] + p.x
-        else:
-            for axis in ti.static(range(self.dim)):
-                hash = hash ^ (p[axis] * self.hashes[axis])
-            hash = hash % ti.static(self.table_sizes[level])
-        return hash
-
-    @ti.kernel
-    def encoding2D(self):
-        for i in self.input_positions:
-            p = self.input_positions[i]
-            for l in ti.static(range(self.n_tables)):
-                uv = p * ti.cast(self.N_l[l], ti.f32)
-                iuv = ti.cast(ti.floor(uv), ti.i32)
-                fuv = ti.math.fract(uv)
-                c00 = self.grids[l][self.spatial_hash(iuv, l)]
-                c01 = self.grids[l][self.spatial_hash(iuv + ivec2(0, 1), l)]
-                c10 = self.grids[l][self.spatial_hash(iuv + ivec2(1, 0), l)]
-                c11 = self.grids[l][self.spatial_hash(iuv + ivec2(1, 1), l)]
-                c0 = c00 * (1.0 - fuv[0]) + c10 * fuv[0]
-                c1 = c01 * (1.0 - fuv[0]) + c11 * fuv[0]
-                c = c0 * (1.0 - fuv[1]) + c1 * fuv[1]
-                self.encoded_positions[i, l * 2 + 0] = c.x
-                self.encoded_positions[i, l * 2 + 1] = c.y
-    
-    @ti.kernel
-    def encoding3D(self):
-        for i in self.input_positions:
-            p = self.input_positions[i]
-            for l in ti.static(range(self.n_tables)):
-                uvz = p * ti.cast(self.N_l[l], ti.f32)
-                iuvz = ti.cast(ti.floor(uvz), ti.i32)
-                fuvz = ti.math.fract(uvz)
-                c000 = self.grids[l][self.spatial_hash(iuvz, l)]
-                c001 = self.grids[l][self.spatial_hash(iuvz + ivec3(0, 0, 1), l)]
-                c010 = self.grids[l][self.spatial_hash(iuvz + ivec3(0, 1, 0), l)]
-                c011 = self.grids[l][self.spatial_hash(iuvz + ivec3(0, 1, 1), l)]
-                c100 = self.grids[l][self.spatial_hash(iuvz + ivec3(1, 0, 0), l)]
-                c101 = self.grids[l][self.spatial_hash(iuvz + ivec3(1, 0, 1), l)]
-                c110 = self.grids[l][self.spatial_hash(iuvz + ivec3(1, 1, 0), l)]
-                c111 = self.grids[l][self.spatial_hash(iuvz + ivec3(1, 1, 1), l)]
-
-                c00 = c000 * (1.0 - fuvz[0]) + c100 * fuvz[0]
-                c01 = c001 * (1.0 - fuvz[0]) + c101 * fuvz[0]
-                c10 = c010 * (1.0 - fuvz[0]) + c110 * fuvz[0]
-                c11 = c011 * (1.0 - fuvz[0]) + c111 * fuvz[0]
-
-                c0 = c00 * (1.0 - fuvz[1]) + c10 * fuvz[1]
-                c1 = c01 * (1.0 - fuvz[1]) + c11 * fuvz[1]
-                c = c0 * (1.0 - fuvz[2]) + c1 * fuvz[1]
-                self.encoded_positions[i, l * 2 + 0] = c.x
-                self.encoded_positions[i, l * 2 + 1] = c.y
-
-
-    def update(self, lr):
-        for i in range(len(self.grids)):
-            g = self.grids[i]
-            g_1st_momemt = self.grids_1st_moment[i]
-            g_2nd_moment = self.grids_2nd_moment[i]
-            ti_update_weights(g, g.grad, g_1st_momemt, g_2nd_moment, lr, 1e-15)
-
-torch_device = torch.device("cuda:0")
-
-# class MLP(nn.Module):
-#     def __init__(self, encoding=None):
-#         super(MLP, self).__init__()
-#         layers = []
-#         input_size = 2
-#         output_size = 3
-#         hidden_size = 256
-#         n_layers = 8
-#         encoding_module = None
-#         self.grid_encoding = None
-
-#         hidden_size = 64
-#         n_layers = 4
-#         self.grid_encoding = MultiResHashEncoding()
-#         self.grid_encoding.initialize()
-#         input_size = self.grid_encoding.n_features
-
-#         encoding_kernel = None
-#         if self.grid_encoding.dim == 2:
-#             encoding_kernel = self.grid_encoding.encoding2D
-#         elif self.grid_encoding.dim == 3:
-#             encoding_kernel = self.grid_encoding.encoding3D
-
-#         encoding_module = Tin(self.grid_encoding, device=torch_device) \
-#             .register_kernel(encoding_kernel) \
-#             .register_input_field(self.grid_encoding.input_positions) \
-#             .register_output_field(self.grid_encoding.encoded_positions)
-#         for l in range(self.grid_encoding.n_tables):
-#             encoding_module.register_internal_field(self.grid_encoding.grids[l])
-#         encoding_module.finish()
-
-#         npars = 0
-#         self.n_layers = n_layers
-#         for i in range(n_layers):
-#             if i == 0:
-#                 if encoding_module is not None:
-#                     layers.append(encoding_module)
-#                 layers.append(nn.Linear(input_size, hidden_size, bias=False))
-#                 layers.append(nn.ReLU(inplace=True))
-#                 npars += input_size * hidden_size
-#             elif i == n_layers - 1:
-#                 layers.append(nn.Linear(hidden_size, output_size, bias=False))
-#                 layers.append(nn.Sigmoid())
-#                 npars += hidden_size * output_size
-#             else:
-#                 layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
-#                 layers.append(nn.ReLU(inplace=True))
-#                 npars += hidden_size * hidden_size
-#         self.mlp = nn.Sequential(*layers).to(torch_device)
-#         print(self)
-#         print(f"Number of parameters: {npars}")
-
-#     def update_ti_modules(self, lr):
-#         if self.grid_encoding is not None:
-#             self.grid_encoding.update(lr)
-
-#     def forward(self, x):
-#         return self.mlp(x)
-
-
-class MLP(nn.Module):
-    def __init__(self, encoding=None):
-        super(MLP, self).__init__()
-        sigma_layers = []
-        color_layers = []
-        input_size = 2
-        output_size = 3
-        hidden_size = 256
-        n_layers = 8
-        encoding_module = None
-        self.grid_encoding = None
-
-        hidden_size = 64
-        n_layers = 4
-        self.grid_encoding = MultiResHashEncoding()
-        self.grid_encoding.initialize()
-        sigma_input_size = self.grid_encoding.n_features
-
-        encoding_kernel = None
-        if self.grid_encoding.dim == 2:
-            encoding_kernel = self.grid_encoding.encoding2D
-        elif self.grid_encoding.dim == 3:
-            encoding_kernel = self.grid_encoding.encoding3D
-
-        encoding_module = Tin(self.grid_encoding, device=torch_device) \
-            .register_kernel(encoding_kernel) \
-            .register_input_field(self.grid_encoding.input_positions) \
-            .register_output_field(self.grid_encoding.encoded_positions)
-        for l in range(self.grid_encoding.n_tables):
-            encoding_module.register_internal_field(self.grid_encoding.grids[l])
-        encoding_module.finish()
-
-        # Hash encoding module
-        self.hash_encoding_module = encoding_module
-
-        n_parameters = 0
-        # Sigma net
-        sigma_output_size = 16 # 1 sigma + 15 features for color net
-        sigma_layers.append(self.hash_encoding_module)
-        sigma_layers.append(nn.Linear(sigma_input_size, hidden_size, bias=False))
-        sigma_layers.append(nn.ReLU(inplace=True))
-        sigma_layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
-        sigma_layers.append(nn.ReLU(inplace=True))
-        sigma_layers.append(nn.Linear(hidden_size, sigma_output_size, bias=False))
-
-        n_parameters += sigma_input_size * hidden_size + hidden_size * hidden_size + hidden_size * sigma_output_size
-        self.sigma_net = nn.Sequential(*sigma_layers).to(torch_device)
-
-        # Color net
-        color_input_size = 18 # 3 + 15
-        color_output_size = 3 # RGB
-        color_layers.append(nn.Linear(color_input_size, hidden_size, bias=False))
-        color_layers.append(nn.ReLU(inplace=True))
-        color_layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
-        color_layers.append(nn.ReLU(inplace=True))
-        color_layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
-        color_layers.append(nn.ReLU(inplace=True))
-        color_layers.append(nn.Linear(hidden_size, color_output_size, bias=False))
-
-        n_parameters += color_input_size * hidden_size + 2 * hidden_size * hidden_size + hidden_size * color_output_size
-        self.color_net = nn.Sequential(*color_layers).to(torch_device)
-
-        print(self)
-        print(f"Number of parameters: {n_parameters}")
-
-    def update_ti_modules(self, lr):
-        if self.grid_encoding is not None:
-            self.grid_encoding.update(lr)
-
-    def forward(self, x):
-        out = self.sigma_net(x)
-        sigma, geo_feat = out[..., 0], out[..., 1:]
-        color_input = torch.cat([input_views, geo_feat], dim=-1)
-        color = self.color_net(color_input)
-        return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
-
-
-
-input_positions = torch.Tensor(BATCH_SIZE, 2).to(torch_device)
-output_colors = torch.Tensor(BATCH_SIZE, 3).to(torch_device)
-
-model = MLP(encoding="instant_ngp")
-# model.fuse()
-
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(beta1, beta2), eps=1e-15, weight_decay=1e-6)
-# optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
-lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+optimizer = optimizer_fn(model.parameters(), lr=learning_rate)
 scaler = torch.cuda.amp.GradScaler()
-loss_fn = torch.nn.MSELoss().to(torch_device)
 
-refine = False
+# train loop
+iter = 0
 
-@ti.func
-def srgb_to_linear(x):
-    return x ** 2.2
+X = []
+Y = []
+for i in range(len(desc["frames"])):
+  print("load img", i)
+  generate_data(desc, i)
+  ti.sync()
+  X.append(input_data.to_torch().to(device).reshape(-1,6))
+  Y.append(output_data.to_torch().to(device).reshape(-1,3))
+X = torch.vstack(X)
+Y = torch.vstack(Y)
 
-@ti.func
-def linear_to_srgb(x):
-    return x ** (1.0 / 2.2)
+ti.imwrite(input_image, "input_full_sample.png")
+ti.imwrite(scaled_image, "input_sample.png")
 
-snap_to_pixel = True
-
-@ti.kernel
-def fill_batch_train(input_positions : ti.types.ndarray(element_dim=1),
-                     output_colors : ti.types.ndarray(element_dim=1),
-                     refine : ti.template()):
-    base = ti.Vector([0.0, 0.0])
-    window = ti.Vector([1.0, 1.0])
-    if ti.static(refine):
-        window = ti.Vector([0.4, 0.4])
-        base = ti.Vector([ti.random(), ti.random()]) * (1.0 - window)
-    for i in range(BATCH_SIZE):
-        uv = base + input_positions[i] * window
-        iuv = ti.cast(ti.floor(uv * ti.Vector([width, height])), ti.i32)
-        if ti.static(snap_to_pixel):
-            uv = ti.cast(iuv, ti.f32) / ti.Vector([width, height])
-        input_positions[i] = uv
-        output_colors[i] = img[iuv] # srgb_to_linear(img[iuv])
-
-width_scaled = width // 5
-height_scaled = height // 5
-
-rendered = ti.Vector.field(4, dtype=ti.f32, shape=(width_scaled, height_scaled))
-
-@ti.kernel
-def fill_batch_test(base : ti.i32, input_positions : ti.types.ndarray(element_dim=1), scale : ti.f32, offset : ti.types.vector(2, ti.f32)):
-    for i in range(BATCH_SIZE):
-        ii = i + base
-        iuv = ti.Vector([ii % width_scaled, ii // width_scaled])
-        uv = ti.cast(iuv, ti.f32) / ti.Vector([width_scaled, height_scaled])
-        input_positions[i] = uv / scale + offset
-
-@ti.kernel
-def paint_batch_test(base : ti.i32, output : ti.types.ndarray(element_dim=1)):
-    for i in range(BATCH_SIZE):
-        ii = i + base
-        iuv = ti.Vector([ii % width_scaled, ii // width_scaled])
-        c = ti.Vector([output[i].r, output[i].g, output[i].b, 1.0])
-        rendered[iuv] = c # linear_to_srgb(c)
-
-window = ti.ui.Window("test", (width_scaled, height_scaled), show_window=False)
-canvas = window.get_canvas()
-gui = window.get_gui()
+torch.save(X, "input_samples.th")
+torch.save(Y, "output_samples.th")
 
 # writer = SummaryWriter()
 
-loss_smooth_0 = 0.0
-loss_smooth_1 = 0.0
+indices = torch.randperm(X.shape[0])
+indices = torch.split(indices, BATCH_SIZE)
 
-soboleng = torch.quasirandom.SobolEngine(dimension=2)
+test_indicies = torch.randperm(len(desc_test["frames"]))
 
-# window.show()
-model.train()
+for iter in range(n_iters):
+  accum_loss = 0.0
+  
+  b = np.random.randint(0, len(indices))
+  Xbatch = X[indices[b]]
+  Ybatch = Y[indices[b]]
+  print("training sample ", Xbatch.shape)
+  with torch.cuda.amp.autocast():
+    pred = model(Xbatch)
+    print("output shape ", pred.shape)
+    loss = loss_fn(pred[:,:3], Ybatch) * 0.1
+  
+  loss.backward()
+  optimizer.step()
+  optimizer.zero_grad()
+  accum_loss += loss.item()
 
-viewer_base = ti.Vector([0.0, 0.0])
-viewer_scale = 1.0
+  if iter % 10 == 9:
+    print(iter, b, "train loss=", accum_loss / 10)
+    # writer.add_scalar('Loss/train', accum_loss / 10, iter)
+    accum_loss = 0.0
 
-iter = 0
-while window.running:
-    input_positions = soboleng.draw(BATCH_SIZE).to(torch_device).requires_grad_(True)
-    fill_batch_train(input_positions, output_colors, refine)
-    
-    with torch.cuda.amp.autocast():
-        pred = model(input_positions)
-        loss = loss_fn(pred, output_colors) * 1e4
+  if iter % 1000 == 0:
+    with torch.no_grad():
+      test_loss = 0.0
+      for i in np.array(test_indicies[:10]):
+        generate_data(desc_test, i)
+        ti.sync()
+        X_test = input_data.to_torch().to(device).reshape(-1,6)
+        Y_test = output_data.to_torch().to(device).reshape(-1,3)
 
-    # scaler.scale(loss).backward()
-    # scaler.step(optimizer)
-    # scaler.update()
-    loss.backward()
-    optimizer.step()
+        Xbatch = X_test.split(BATCH_SIZE)
+        Ybatch = Y_test.split(BATCH_SIZE)
 
-    model.update_ti_modules(lr = learning_rate)
+        img_pred = []
 
-    optimizer.zero_grad()
+        for b in range(len(Xbatch)):
+          with torch.cuda.amp.autocast():
+            pred = model(Xbatch[b])
+            loss = loss_fn(pred[:, :3], Ybatch[b])
+            img_pred.append(pred)
+            test_loss += loss.item()
 
-    # writer.add_scalar('Loss/train', loss.item(), iter)
+        img_pred = torch.vstack(img_pred)
+        img_pred = img_pred.cpu().detach().numpy()
+        img_pred = img_pred.reshape((int(image_w), int(image_h), 3))
 
-    if iter % 25 == 0:
-        i = 0
-        model.eval()
-        while i < (width_scaled * height_scaled):
-            fill_batch_test(i, input_positions, viewer_scale, viewer_base)
-            pred = model(input_positions)
-            paint_batch_test(i, pred)
-            i += BATCH_SIZE
-        model.train()
-    
-    loss_smooth_0 = loss_smooth_0 * 0.9 + loss.item() * 0.1
-    
-    if iter % 5 == 4:
-        learning_rate = 10.0 ** gui.slider_float("learning_rate (log)", np.log10(learning_rate), -10.0, 1.0)
-        canvas.set_image(rendered)
-        refine = gui.checkbox("refine", refine)
-        gui.text(f"Iteration {iter}, exp_lr={lr_scheduler.get_last_lr()[-1]:.2e}")
-        gui.text(f"loss smooth = {loss_smooth_0}")
-        viewer_scale = gui.slider_float("viewer_scale", viewer_scale, 1.0, 8.0)
-        viewer_base[0] = gui.slider_float("viewer_base_x", viewer_base[0], 0.0, 1.0)
-        viewer_base[1] = gui.slider_float("viewer_base_y", viewer_base[1], 0.0, 1.0)
-        if iter % 1000 == 999:
-            window.save_image(f"{iter:06d}.png")
-            lr_scheduler.step()
-        # window.show()
+        if i == test_indicies[0]:
+          ti.imwrite(img_pred, "output_iter" + str(iter) + "_r" + str(i) + ".png")
+      
+    #   writer.add_scalar('Loss/test', test_loss / 10.0, iter / 1000.0)
+      print("test loss=", test_loss / 10.0)
 
-    iter += 1
+  if iter % 5000 == 0:
+    torch.save(model, "model_" + str(iter) + ".pth")
