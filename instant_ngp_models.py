@@ -38,10 +38,10 @@ def ti_update_weights(weight : ti.template(),
 
 @ti.data_oriented
 class MultiResHashEncoding:
-    def __init__(self, batch_size, N_max, dim=3) -> None:
+    def __init__(self, batch_size, N_max, max_samples, dim=3) -> None:
         self.dim = dim
         self.batch_size = batch_size
-        self.input_positions = ti.Vector.field(self.dim, dtype=ti.f32, shape=(self.batch_size), needs_grad=False)
+        self.input_positions = ti.Vector.field(self.dim, dtype=ti.f32, shape=(max_samples * self.batch_size), needs_grad=False)
         self.grids = []
         self.grids_1st_moment = []
         self.grids_2nd_moment = []
@@ -52,6 +52,7 @@ class MultiResHashEncoding:
         self.n_tables = 16
         self.b = np.exp((np.log(self.N_max) - np.log(self.N_min)) / (self.n_tables - 1)) # Equation (3)
         self.max_table_size = 2 ** 19
+        self.per_level_scales = 1.3195079565048218
 
         print("n_tables", self.n_tables)
         self.table_sizes = []
@@ -60,21 +61,24 @@ class MultiResHashEncoding:
         self.n_features = 0
         self.max_direct_map_level = 0
         for i in range(self.n_tables):
-            N_l = int(np.floor(self.N_min * (self.b ** i))) # Equation (2)
-            self.N_l.append(N_l)
-            table_size = min(self.max_table_size, N_l ** self.dim)
+            # resolution = int(np.floor(self.N_min * (self.b ** i))) # Equation (2)
+            resolution = int(np.ceil(self.N_min * np.exp(i*np.log(self.per_level_scales)) - 1.0)) + 1
+            self.N_l.append(resolution)
+            table_size = resolution**self.dim
+            table_size = int(resolution**self.dim) if table_size % 8 == 0 else int((table_size + 8 - 1) / 8) * 8
+            table_size = min(self.max_table_size, table_size)
             self.table_sizes.append(table_size)
-            if table_size == N_l ** self.dim:
+            if table_size == resolution ** self.dim:
                 self.max_direct_map_level = i
-                table_size = (N_l + 1) ** self.dim
-            print(f"level {i} resolution: {N_l} n_entries: {table_size}")
+                # table_size = (resolution + 1) ** self.dim
+            print(f"level {i} resolution: {resolution} n_entries: {table_size}")
             
             self.grids.append(ti.Vector.field(self.F, dtype=ti.f32, shape=(table_size), needs_grad=True))
             self.grids_1st_moment.append(ti.Vector.field(self.F, dtype=ti.f32, shape=(table_size)))
             self.grids_2nd_moment.append(ti.Vector.field(self.F, dtype=ti.f32, shape=(table_size)))
             self.n_features += self.F
             self.n_params += self.F * table_size
-        self.encoded_positions = ti.field(dtype=ti.f32, shape=(self.batch_size, self.n_features), needs_grad=True)
+        self.encoded_positions = ti.field(dtype=ti.f32, shape=(max_samples * self.batch_size, self.n_features), needs_grad=True)
         self.hashes = [1, 2654435761, 805459861]
         
         print(f"dim {self.dim}, hash table #params: {self.n_params}")
@@ -87,14 +91,14 @@ class MultiResHashEncoding:
 
     @ti.func
     def spatial_hash(self, p, level : ti.template()):
-        hash = 0
+        hash = ti.uint32(0)
         if ti.static(level <= self.max_direct_map_level):
             hash = p.z * self.N_l[level] * self.N_l[level] + p.y * self.N_l[level] + p.x
         else:
             for axis in ti.static(range(self.dim)):
                 hash = hash ^ (p[axis] * ti.uint32(self.hashes[axis]))
             hash = hash % ti.static(self.table_sizes[level])
-        return hash
+        return int(hash)
 
     @ti.kernel
     def encoding2D(self):
@@ -152,14 +156,14 @@ class MultiResHashEncoding:
 
 
 class MLP(nn.Module):
-    def __init__(self, batch_size, N_max):
+    def __init__(self, batch_size, N_max, max_samples):
         super(MLP, self).__init__()
         sigma_layers = []
         color_layers = []
         encoding_module = None
         self.grid_encoding = None
         hidden_size = 64
-        self.grid_encoding = MultiResHashEncoding(batch_size=batch_size, N_max=N_max)
+        self.grid_encoding = MultiResHashEncoding(batch_size=batch_size, N_max=N_max, max_samples=max_samples)
         self.grid_encoding.initialize()
         sigma_input_size = self.grid_encoding.n_features
 
@@ -199,6 +203,7 @@ class MLP(nn.Module):
         color_layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
         color_layers.append(nn.ReLU(inplace=True))
         color_layers.append(nn.Linear(hidden_size, color_output_size, bias=False))
+        color_layers.append(nn.Sigmoid())
 
         n_parameters += color_input_size * hidden_size + hidden_size * hidden_size + hidden_size * color_output_size
         self.color_net = nn.Sequential(*color_layers).to(torch_device)
@@ -245,23 +250,27 @@ def gen_samples(x : ti.types.ndarray(element_dim=1),
 
 
 class NerfDriver(nn.Module):
-    def __init__(self, batch_size, N_max):
+    def __init__(self, batch_size, N_max, max_samples):
         super(NerfDriver, self).__init__()
-        self.mlp = MLP(batch_size=batch_size, N_max=N_max)
+        self.mlp = MLP(batch_size=batch_size, N_max=N_max, max_samples=max_samples)
         self.dir_encoder = SHEncoder()
+        self.max_samples=max_samples
 
     def query(self, input, mlp : MLP):
+        input = input.reshape(-1, 19)
+        # print("mlp input shape ", input.shape)
         out = mlp(input)
         color, density = out[:, :3], out[:, -1]
+        # print("density shape ", density.shape)
         return density, color
     
     def composite(self, density, color, dists, samples, batch_size):
-        # density = density.reshape(samples, batch_size)
-        density = torch.unsqueeze(density, 0).repeat(samples, 1)
-        # color = color.reshape(samples, batch_size, 3)
-        color = torch.unsqueeze(color, 0).repeat(samples, 1, 1)
+        density = density.reshape(samples, batch_size)
+        # density = torch.unsqueeze(density, 0).repeat(samples, 1)
+        color = color.reshape(samples, batch_size, 3)
+        # color = torch.unsqueeze(color, 0).repeat(samples, 1, 1)
 
-        # print("density shape ", density.shape, " color shape ", color.shape)
+        print("density shape ", density.shape, " color shape ", color.shape)
         # Convert density to alpha
         alpha = 1.0 - torch.exp(-F.relu(density) * dists)
         # Composite
@@ -272,20 +281,19 @@ class NerfDriver(nn.Module):
 
     def forward(self, x):
         # x [batch, (pos, dir)]
-        pos, dir = x[:, :3], x[:, 3:]
         batch_size = x.shape[0]
-        samples = 128
-        pos_query = torch.Tensor(size=(samples, x.shape[0], 3)).to(torch_device)
-        view_dir = torch.Tensor(size=(samples, x.shape[0], 3)).to(torch_device)
-        dists = torch.Tensor(size=(samples, x.shape[0])).to(torch_device)
+        samples = self.max_samples
+        pos_query = torch.Tensor(size=(samples, batch_size, 3)).to(torch_device)
+        view_dir = torch.Tensor(size=(samples, batch_size, 3)).to(torch_device)
+        dists = torch.Tensor(size=(samples, batch_size)).to(torch_device)
 
         gen_samples(x, pos_query, view_dir, dists, samples, batch_size)
         ti.sync()
         torch.cuda.synchronize(device=None)
 
-        encoded_dir = self.dir_encoder(dir)
-        # print("pos, encoded dir ", pos.shape, " ", encoded_dir.shape)
-        input = torch.cat([pos, encoded_dir], dim=1)
+        encoded_dir = self.dir_encoder(view_dir)
+        # print("pos, encoded dir ", pos_query.shape, " ", encoded_dir.shape)
+        input = torch.cat([pos_query, encoded_dir], dim=2)
         # print("input to the network shape ", input.shape)
         # Query fine model
         density, color = self.query(input, self.mlp)

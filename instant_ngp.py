@@ -5,7 +5,7 @@ import json
 from instant_ngp_models import NerfDriver
 # from torch.utils.tensorboard import SummaryWriter
 
-ti.init(arch=ti.cuda, device_memory_GB=2)
+ti.init(arch=ti.cuda, packed=True, device_memory_GB=8)
 
 def loss_fn(X, Y):
     #   return torch.mean((X-Y)**2)
@@ -19,6 +19,7 @@ image_h = 800.0 / downscale
 
 BATCH_SIZE = 2 << 18
 BATCH_SIZE = int(image_w * image_h)
+MAX_SAMPLES = 32
 learning_rate = 1e-3
 n_iters = 10000
 optimizer_fn = torch.optim.Adam
@@ -102,22 +103,31 @@ desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.
 device = "cuda"
 
 N_max = max(image_w, image_h) // 2
-model = NerfDriver(batch_size=BATCH_SIZE, N_max=N_max)
+model = NerfDriver(batch_size=BATCH_SIZE, N_max=N_max, max_samples=MAX_SAMPLES)
 
 
 np_type = np.float32
 model_dir = "./npy_models/"
 npy_file = "lego.npy"
+
+@ti.kernel
+def load_parameters(ti_field: ti.template(), arr: ti.types.ndarray(), offset: int):
+    for i in ti_field:
+        for j in ti.static(range(2)):
+              ti_field[i][j] = arr[offset+i+j]
+      
 # Load parameters
 def load_model(nerf_driver: NerfDriver, model_path):
     print('Loading model from {}'.format(model_path))
     sigma_net_state_dict = nerf_driver.mlp.sigma_net.state_dict()
     color_net_state_dict = nerf_driver.mlp.color_net.state_dict()
+    hash_encoding_module = nerf_driver.mlp.grid_encoding
 
     # Load pre-trained model parameters
     model = np.load(model_path, allow_pickle=True).item()
     sigma_weights = model['model.xyz_sigmas.params'].astype(np_type)
     rgb_weights = model['model.rgb_net.params'].astype(np_type)
+    hash_embedding = model['model.xyz_encoder.params'].astype(np_type)
 
     for name, value in sigma_net_state_dict.items():
         print("value before load ", value.shape)
@@ -151,12 +161,20 @@ def load_model(nerf_driver: NerfDriver, model_path):
         shape_after_load = value.shape
         assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
         print("value after load ", value.shape)
+    
+    print("hash embedding ", hash_embedding.shape)
+    offset = 0
+    for l in range(hash_encoding_module.n_tables):
+      table_size = hash_encoding_module.table_sizes[l]
+      print(f"[Level] {l}, table size {table_size} ")
+      # hash_encoding_module.grids[l].from_numpy(hash_embedding[offset:table_size*2])
+      load_parameters(hash_encoding_module.grids[l], hash_embedding, offset)
+      offset += table_size*2
+    print("offset ", offset)
+    assert offset == hash_embedding.shape[0], "Hash encoding parameters load mismatch."
     # assert 1 == -1
-    
-    # self.hash_embedding.from_numpy(model['model.xyz_encoder.params'].astype(np_type))
-    
-    # self.sigma_weights.from_numpy(model['model.xyz_sigmas.params'].astype(np_type))
-    # self.rgb_weights.from_numpy(model['model.rgb_net.params'].astype(np_type))
+
+
 load_model(model, model_dir + npy_file)
 
 
@@ -177,6 +195,7 @@ for i in range(len(desc["frames"])):
 X = torch.stack(X, dim=0)
 Y = torch.stack(Y, dim=0)
 print("training data ", X.shape, " test data ", Y.shape)
+print("scaled image data ", scaled_image.to_numpy().sum())
 ti.tools.imwrite(input_image, "input_full_sample.png")
 ti.tools.imwrite(scaled_image, "input_sample.png")
 
@@ -205,7 +224,7 @@ for iter in range(n_iters):
   loss.backward()
   optimizer.step()
 
-#   model.update_ti_modules(lr = learning_rate)
+  model.update_ti_modules(lr = learning_rate)
 
   optimizer.zero_grad()
   accum_loss += loss.item()
@@ -245,6 +264,7 @@ for iter in range(n_iters):
         img_pred = img_pred.reshape((int(image_w), int(image_h), 3))
 
         if i == test_indicies[0]:
+          # print("img pred ", img_pred)
           ti.tools.imwrite(img_pred, "output_iter" + str(iter) + "_r" + str(i) + ".png")
       
     #   writer.add_scalar('Loss/test', test_loss / 10.0, iter / 1000.0)
