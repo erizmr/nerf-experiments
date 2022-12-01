@@ -14,10 +14,10 @@ torch_device = torch.device("cuda:0")
 beta1 = 0.9
 beta2 = 0.99
 
-@ti.kernel
-def ti_update_weights(weight : ti.template(), grad : ti.template(), lr : ti.f32):
-    for I in ti.grouped(weight):
-        weight[I] -= lr * grad[I]
+# @ti.kernel
+# def ti_update_weights(weight : ti.template(), grad : ti.template(), lr : ti.f32):
+#     for I in ti.grouped(weight):
+#         weight[I] -= lr * grad[I]
 
 
 @ti.kernel
@@ -51,7 +51,7 @@ class MultiResHashEncoding:
         self.N_min = 16
         self.n_tables = 16
         self.b = np.exp((np.log(self.N_max) - np.log(self.N_min)) / (self.n_tables - 1)) # Equation (3)
-        self.max_table_size = (2 << 16)
+        self.max_table_size = 2 ** 19
 
         print("n_tables", self.n_tables)
         self.table_sizes = []
@@ -75,8 +75,9 @@ class MultiResHashEncoding:
             self.n_features += self.F
             self.n_params += self.F * table_size
         self.encoded_positions = ti.field(dtype=ti.f32, shape=(self.batch_size, self.n_features), needs_grad=True)
-        self.hashes = [1, 265443576, 805459861]
-        print(f"hash table #params: {self.n_params}")
+        self.hashes = [1, 2654435761, 805459861]
+        
+        print(f"dim {self.dim}, hash table #params: {self.n_params}")
 
     @ti.kernel
     def initialize(self):
@@ -88,10 +89,10 @@ class MultiResHashEncoding:
     def spatial_hash(self, p, level : ti.template()):
         hash = 0
         if ti.static(level <= self.max_direct_map_level):
-            hash = p.y * self.N_l[level] + p.x
+            hash = p.z * self.N_l[level] * self.N_l[level] + p.y * self.N_l[level] + p.x
         else:
             for axis in ti.static(range(self.dim)):
-                hash = hash ^ (p[axis] * self.hashes[axis])
+                hash = hash ^ (p[axis] * ti.uint32(self.hashes[axis]))
             hash = hash % ti.static(self.table_sizes[level])
         return hash
 
@@ -185,11 +186,9 @@ class MLP(nn.Module):
         sigma_layers.append(self.hash_encoding_module)
         sigma_layers.append(nn.Linear(sigma_input_size, hidden_size, bias=False))
         sigma_layers.append(nn.ReLU(inplace=True))
-        sigma_layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
-        sigma_layers.append(nn.ReLU(inplace=True))
         sigma_layers.append(nn.Linear(hidden_size, sigma_output_size, bias=False))
 
-        n_parameters += sigma_input_size * hidden_size + hidden_size * hidden_size + hidden_size * sigma_output_size
+        n_parameters += sigma_input_size * hidden_size + hidden_size * sigma_output_size
         self.sigma_net = nn.Sequential(*sigma_layers).to(torch_device)
 
         # Color net
@@ -199,11 +198,9 @@ class MLP(nn.Module):
         color_layers.append(nn.ReLU(inplace=True))
         color_layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
         color_layers.append(nn.ReLU(inplace=True))
-        color_layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
-        color_layers.append(nn.ReLU(inplace=True))
         color_layers.append(nn.Linear(hidden_size, color_output_size, bias=False))
 
-        n_parameters += color_input_size * hidden_size + 2 * hidden_size * hidden_size + hidden_size * color_output_size
+        n_parameters += color_input_size * hidden_size + hidden_size * hidden_size + hidden_size * color_output_size
         self.color_net = nn.Sequential(*color_layers).to(torch_device)
 
         print(self)
@@ -214,6 +211,7 @@ class MLP(nn.Module):
             self.grid_encoding.update(lr)
 
     def forward(self, x):
+        # x [batch, 3+16] 3 for position, 16 for encoded directions
         input_pos, input_dir = x[:,:3], x[:,3:]
         out = self.sigma_net(input_pos)
         sigma, geo_feat = out[..., 0], out[..., 1:]
@@ -284,7 +282,7 @@ class NerfDriver(nn.Module):
         gen_samples(x, pos_query, view_dir, dists, samples, batch_size)
         ti.sync()
         torch.cuda.synchronize(device=None)
-        
+
         encoded_dir = self.dir_encoder(dir)
         # print("pos, encoded dir ", pos.shape, " ", encoded_dir.shape)
         input = torch.cat([pos, encoded_dir], dim=1)

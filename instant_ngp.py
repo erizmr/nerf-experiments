@@ -1,15 +1,15 @@
 import taichi as ti
+import torch
 import numpy as np
 import json
 from instant_ngp_models import NerfDriver
 # from torch.utils.tensorboard import SummaryWriter
 
-import torch
-
 ti.init(arch=ti.cuda, device_memory_GB=2)
 
 def loss_fn(X, Y):
-      return torch.mean((X-Y)**2)
+    #   return torch.mean((X-Y)**2)
+      return ((X-Y)**2).sum()
 
 set_name = "nerf_synthetic"
 scene_name = "lego"
@@ -27,7 +27,7 @@ input_image = ti.Vector.field((4), dtype=ti.f32, shape=(int(image_w) * downscale
 input_data = ti.Vector.field((6), dtype=ti.f32, shape=(int(image_w * image_h)))
 output_data = ti.Vector.field((3), dtype=ti.f32, shape=(int(image_w * image_h)))
 scaled_image = ti.Vector.field((4), dtype=ti.f32, shape=(int(image_w), int(image_h)))
-
+camera_mtx = ti.Vector.field(3, dtype=ti.f32, shape=(3))
 
 def load_desc_from_json(filename):
   f = open(filename, "r")
@@ -37,15 +37,11 @@ def load_desc_from_json(filename):
   print("=", len(decoded["frames"]) * image_w * image_h, "samples")
   return decoded
 
-# Assume Z is up?
-
 @ti.func
 def get_arg(dir_x : ti.f32, dir_y : ti.f32, dir_z : ti.f32):
   theta = ti.atan2(dir_y, dir_x)
   phi = ti.atan2(dir_z, ti.sqrt(dir_x * dir_x + dir_y * dir_y))
   return theta, phi
-
-camera_mtx = ti.Vector.field(3, dtype=ti.f32, shape=(3))
 
 @ti.func
 def normalize(v):
@@ -98,6 +94,7 @@ def generate_data(desc, i):
   ti.sync()
   image_to_data(input_image, scaled_image, input_data, output_data, float(desc["camera_angle_x"]), float(desc["camera_angle_x"]), ray_o[0], ray_o[1], ray_o[2])
 
+
 desc = load_desc_from_json(set_name + "/" + scene_name + "/transforms_train.json")
 desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.json")
 
@@ -106,6 +103,62 @@ device = "cuda"
 
 N_max = max(image_w, image_h) // 2
 model = NerfDriver(batch_size=BATCH_SIZE, N_max=N_max)
+
+
+np_type = np.float32
+model_dir = "./npy_models/"
+npy_file = "lego.npy"
+# Load parameters
+def load_model(nerf_driver: NerfDriver, model_path):
+    print('Loading model from {}'.format(model_path))
+    sigma_net_state_dict = nerf_driver.mlp.sigma_net.state_dict()
+    color_net_state_dict = nerf_driver.mlp.color_net.state_dict()
+
+    # Load pre-trained model parameters
+    model = np.load(model_path, allow_pickle=True).item()
+    sigma_weights = model['model.xyz_sigmas.params'].astype(np_type)
+    rgb_weights = model['model.rgb_net.params'].astype(np_type)
+
+    for name, value in sigma_net_state_dict.items():
+        print("value before load ", value.shape)
+        shape_before_load = value.shape
+        if name == "1.weight":
+            value = torch.from_numpy(sigma_weights[:64*32]).reshape(64, 32)
+            print("sigma layer ", name," load ", value.shape)
+        elif name == "3.weight":
+            value = torch.from_numpy(sigma_weights[64*32:]).reshape(16, 64)
+            print("sigma layer ", name," load ", value.shape)
+        shape_after_load = value.shape
+        assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
+        print("value after load ", value.shape)
+    
+    for name, value in color_net_state_dict.items():
+
+        print("!!color layer ", name," load ", value.shape)
+
+        print("value before load ", value.shape)
+        shape_before_load = value.shape
+
+        if name == "0.weight":
+            value = torch.from_numpy(rgb_weights[:64*32]).reshape(64, 32)
+            print("color layer ", name," load ", value.shape)
+        elif name == "2.weight":
+            value = torch.from_numpy(rgb_weights[64*32:64*32+64*64]).reshape(64, 64)
+            print("color layer ", name," load ", value.shape)
+        elif name == "4.weight":
+            value = torch.from_numpy(rgb_weights[64*32+64*64:64*32+64*64+3*64]).reshape(3, 64)
+            print("color layer ", name," load ", value.shape)
+        shape_after_load = value.shape
+        assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
+        print("value after load ", value.shape)
+    # assert 1 == -1
+    
+    # self.hash_embedding.from_numpy(model['model.xyz_encoder.params'].astype(np_type))
+    
+    # self.sigma_weights.from_numpy(model['model.xyz_sigmas.params'].astype(np_type))
+    # self.rgb_weights.from_numpy(model['model.rgb_net.params'].astype(np_type))
+load_model(model, model_dir + npy_file)
+
 
 optimizer = optimizer_fn(model.parameters(), lr=learning_rate)
 scaler = torch.cuda.amp.GradScaler()
@@ -124,11 +177,11 @@ for i in range(len(desc["frames"])):
 X = torch.stack(X, dim=0)
 Y = torch.stack(Y, dim=0)
 print("training data ", X.shape, " test data ", Y.shape)
-ti.imwrite(input_image, "input_full_sample.png")
-ti.imwrite(scaled_image, "input_sample.png")
+ti.tools.imwrite(input_image, "input_full_sample.png")
+ti.tools.imwrite(scaled_image, "input_sample.png")
 
-torch.save(X, "input_samples.th")
-torch.save(Y, "output_samples.th")
+# torch.save(X, "input_samples.th")
+# torch.save(Y, "output_samples.th")
 
 # writer = SummaryWriter()
 
@@ -151,18 +204,19 @@ for iter in range(n_iters):
   
   loss.backward()
   optimizer.step()
-  
-  model.update_ti_modules(lr = learning_rate)
+
+#   model.update_ti_modules(lr = learning_rate)
 
   optimizer.zero_grad()
   accum_loss += loss.item()
+  
 
   if iter % 10 == 9:
-    print(iter, b, "train loss=", accum_loss)
+    print(iter, b, "train loss=", accum_loss / 10)
     # writer.add_scalar('Loss/train', accum_loss / 10, iter)
     accum_loss = 0.0
 
-  if iter % 1000 == 0:
+  if iter % 500 == 0:
     with torch.no_grad():
       test_loss = 0.0
       for i in np.array(test_indicies[:10]):
@@ -191,7 +245,7 @@ for iter in range(n_iters):
         img_pred = img_pred.reshape((int(image_w), int(image_h), 3))
 
         if i == test_indicies[0]:
-          ti.imwrite(img_pred, "output_iter" + str(iter) + "_r" + str(i) + ".png")
+          ti.tools.imwrite(img_pred, "output_iter" + str(iter) + "_r" + str(i) + ".png")
       
     #   writer.add_scalar('Loss/test', test_loss / 10.0, iter / 1000.0)
       print("test loss=", test_loss / 10.0)
