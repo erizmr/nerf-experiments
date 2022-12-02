@@ -3,8 +3,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import platform
 
 from stannum import Tin
+from matplotlib import pyplot as plt
 from taichi.math import ivec2, ivec3
 from math_utils import ray_aabb_intersection
 from instant_ngp_utils import SHEncoder
@@ -38,19 +40,19 @@ def ti_update_weights(weight : ti.template(),
 
 @ti.data_oriented
 class MultiResHashEncoding:
-    def __init__(self, batch_size, N_max, max_samples, dim=3) -> None:
+    def __init__(self, batch_size, dim=3) -> None:
         self.dim = dim
         self.batch_size = batch_size
-        self.input_positions = ti.Vector.field(self.dim, dtype=ti.f32, shape=(max_samples * self.batch_size), needs_grad=False)
+        self.input_positions = ti.Vector.field(self.dim, dtype=ti.f32, shape=(self.batch_size), needs_grad=False)
         self.grids = []
         self.grids_1st_moment = []
         self.grids_2nd_moment = []
 
         self.F = 2 # Number of feature dimensions per entry F = 2
-        self.N_max = N_max
+        # self.N_max = N_max
         self.N_min = 16
         self.n_tables = 16
-        self.b = np.exp((np.log(self.N_max) - np.log(self.N_min)) / (self.n_tables - 1)) # Equation (3)
+        # self.b = np.exp((np.log(self.N_max) - np.log(self.N_min)) / (self.n_tables - 1)) # Equation (3)
         self.max_table_size = 2 ** 19
         self.per_level_scales = 1.3195079565048218
 
@@ -78,7 +80,7 @@ class MultiResHashEncoding:
             self.grids_2nd_moment.append(ti.Vector.field(self.F, dtype=ti.f32, shape=(table_size)))
             self.n_features += self.F
             self.n_params += self.F * table_size
-        self.encoded_positions = ti.field(dtype=ti.f32, shape=(max_samples * self.batch_size, self.n_features), needs_grad=True)
+        self.encoded_positions = ti.field(dtype=ti.f32, shape=(self.batch_size, self.n_features), needs_grad=True)
         self.hashes = [1, 2654435761, 805459861]
         
         print(f"dim {self.dim}, hash table #params: {self.n_params}")
@@ -157,14 +159,14 @@ class MultiResHashEncoding:
 
 
 class MLP(nn.Module):
-    def __init__(self, batch_size, N_max, max_samples):
+    def __init__(self, batch_size):
         super(MLP, self).__init__()
         sigma_layers = []
         color_layers = []
         encoding_module = None
         self.grid_encoding = None
         hidden_size = 64
-        self.grid_encoding = MultiResHashEncoding(batch_size=batch_size, N_max=N_max, max_samples=max_samples)
+        self.grid_encoding = MultiResHashEncoding(batch_size=batch_size)
         self.grid_encoding.initialize()
         sigma_input_size = self.grid_encoding.n_features
 
@@ -226,14 +228,31 @@ class MLP(nn.Module):
         return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
 
 
+if platform.system() == 'Darwin':
+    block_dim = 64
+else:
+    block_dim = 128
 
+sigma_sm_preload = int(128/block_dim)*24
+rgb_sm_preload = int(128/block_dim)*50
 data_type = ti.f16
 np_type = np.float16
-tf_vec2 = ti.types.vector(2, dtype=data_type)
 tf_vec3 = ti.types.vector(3, dtype=data_type)
 tf_vec8 = ti.types.vector(8, dtype=data_type)
 tf_vec32 = ti.types.vector(32, dtype=data_type)
+tf_vec1 = ti.types.vector(1, dtype=data_type)
+tf_vec2 = ti.types.vector(2, dtype=data_type)
+tf_mat1x3 = ti.types.matrix(1, 3, dtype=data_type)
+tf_index_temp = ti.types.vector(8, dtype=ti.i32)
 NEAR_DISTANCE = 0.01
+
+SQRT3 = 1.7320508075688772
+SQRT3_MAX_SAMPLES = SQRT3/1024
+SQRT3_2 = 1.7320508075688772*2
+
+@ti.func
+def calc_dt(t, exp_step_factor, grid_size, scale):
+    return data_type(ti.math.clamp(t*exp_step_factor, SQRT3_MAX_SAMPLES, SQRT3_2*scale/grid_size))
 
 
 @ti.func
@@ -259,12 +278,11 @@ def load_to_field(ti_field: ti.template(), arr: ti.types.ndarray(), offset: int)
 
 @ti.data_oriented
 class NerfDriver:
-    def __init__(self, batch_size, N_max, max_samples, scale, cascades, grid_size, base_res, log2_T, res, level, exp_step_factor):
+    def __init__(self, scale, cascades, grid_size, base_res, log2_T, res, level, exp_step_factor):
         super(NerfDriver, self).__init__()
 
-        self.mlp = MLP(batch_size=batch_size, N_max=N_max, max_samples=max_samples)
+        self.mlp = MLP(batch_size=res[0] * res[1])
         self.dir_encoder = SHEncoder()
-        self.max_samples=max_samples
         
         self.res = res
         self.N_rays = res[0] * res[1]
@@ -296,6 +314,41 @@ class NerfDriver:
         self.density_bitfield = ti.field(ti.uint8, shape=(cascades*grid_size**3//8))
         print("grid_size ", grid_size, " grid_size**3 ", grid_size**3//8)
 
+        # count the number of rays that still alive
+        self.counter = ti.field(ti.i32, shape=())
+        self.counter[None] = self.N_rays
+        # current alive buffer index
+        self.current_index = ti.field(ti.i32, shape=())
+        self.current_index[None] = 0
+
+        # how many samples that need to run the model
+        self.model_launch = ti.field(ti.i32, shape=())
+
+        # buffer for the alive rays
+        self.alive_indices = ti.field(ti.i32, shape=(2*self.N_rays,))
+
+        # padd the thread to the factor of block size (thread per block)
+        self.padd_block_network = ti.field(ti.i32, shape=())
+        self.padd_block_composite = ti.field(ti.i32, shape=())
+
+        # hash table variables
+        self.min_samples = 1 if exp_step_factor==0 else 4
+        self.per_level_scales = 1.3195079565048218 # hard coded, otherwise it will be have lower percision
+        self.base_res = base_res
+        self.max_params = 2**log2_T
+        self.level = level
+        # hash table fields
+        self.offsets = ti.field(ti.i32, shape=(16,))
+        self.hash_map_sizes = ti.field(ti.uint32, shape=(16,))
+        self.hash_map_indicator = ti.field(ti.i32, shape=(16,))
+
+        # model parameters
+        layer1_base = 32 * 64
+        layer2_base = layer1_base + 64 * 64
+        self.hash_embedding= ti.field(dtype=data_type, shape=(11445040,))
+        self.sigma_weights= ti.field(dtype=data_type, shape=(layer1_base + 64*16,))
+        self.rgb_weights= ti.field(dtype=data_type, shape=(layer2_base+64*8,))
+
         # buffers that used for points sampling 
         self.max_samples_per_rays = 1
         self.max_samples_shape = self.N_rays * self.max_samples_per_rays
@@ -305,9 +358,20 @@ class NerfDriver:
         self.deltas = ti.field(data_type, shape=(self.max_samples_shape,))
         self.ts = ti.field(data_type, shape=(self.max_samples_shape,))
 
+        # buffers that store the info of sampled points
+        self.run_model_ind = ti.field(ti.int32, shape=(self.max_samples_shape,))
+        self.N_eff_samples = ti.field(ti.int32, shape=(self.N_rays,))
+
+        # intermediate buffers for network
+        self.xyzs_embedding = ti.field(data_type, shape=(self.max_samples_shape, 32))
+        self.final_embedding = ti.field(data_type, shape=(self.max_samples_shape, 16))
+        self.out_3 = ti.field(data_type, shape=(self.max_samples_shape, 3))
+        self.out_1 = ti.field(data_type, shape=(self.max_samples_shape,))
+        self.temp_hit = ti.field(ti.i32, shape=(self.max_samples_shape,))
+
         # results buffers
-        # self.opacity = ti.field(ti.f32, shape=(self.N_rays,))
-        # self.depth = ti.field(ti.f32, shape=(self.N_rays))
+        self.opacity = ti.field(ti.f32, shape=(self.N_rays,))
+        self.depth = ti.field(ti.f32, shape=(self.N_rays))
         self.rgb = ti.Vector.field(3, dtype=ti.f32, shape=(self.N_rays,))
 
         # GUI render buffer (data type must be float32)
@@ -330,35 +394,47 @@ class NerfDriver:
         rgb_weights = model['model.rgb_net.params'].astype(np_type)
         hash_embedding = model['model.xyz_encoder.params'].astype(np_type)
 
-        for name, value in sigma_net_state_dict.items():
-            print("value before load ", value.shape)
-            shape_before_load = value.shape
-            if name == "1.weight":
-                value = torch.from_numpy(sigma_weights[:64*32]).reshape(64, 32)
-                print("sigma layer ", name," load ", value.shape)
-            elif name == "3.weight":
-                value = torch.from_numpy(sigma_weights[64*32:]).reshape(16, 64)
-                print("sigma layer ", name," load ", value.shape)
-            shape_after_load = value.shape
-            assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
-            print("value after load ", value.shape)
-        
-        for name, value in color_net_state_dict.items():
-            print("value before load ", value.shape)
-            shape_before_load = value.shape
+        # for name, value in sigma_net_state_dict.items():
+        #     print("value before load ", value.shape)
+        #     shape_before_load = value.shape
+        #     if name == "1.weight":
+        #         value = torch.from_numpy(sigma_weights[:64*32]).reshape(64, 32)
+        #         print("sigma layer ", name," load ", value.shape)
+        #     elif name == "3.weight":
+        #         value = torch.from_numpy(sigma_weights[64*32:]).reshape(16, 64)
+        #         print("sigma layer ", name," load ", value.shape)
+        #     shape_after_load = value.shape
+        #     assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
+        #     print("value after load ", value.shape)
+        old_val = sigma_net_state_dict["1.weight"].cpu().numpy().astype(np_type)
+        print("old val ", old_val)
+        sigma_net_state_dict["1.weight"] = torch.from_numpy(sigma_weights[:64*32]).reshape(64, 32)
+        new_val = sigma_net_state_dict["1.weight"].cpu().numpy().astype(np_type)
+        print("new val ", new_val)
+        assert not np.allclose(old_val, new_val, 1e-5)
 
-            if name == "0.weight":
-                value = torch.from_numpy(rgb_weights[:64*32]).reshape(64, 32)
-                print("color layer ", name," load ", value.shape)
-            elif name == "2.weight":
-                value = torch.from_numpy(rgb_weights[64*32:64*32+64*64]).reshape(64, 64)
-                print("color layer ", name," load ", value.shape)
-            elif name == "4.weight":
-                value = torch.from_numpy(rgb_weights[64*32+64*64:64*32+64*64+3*64]).reshape(3, 64)
-                print("color layer ", name," load ", value.shape)
-            shape_after_load = value.shape
-            assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
-            print("value after load ", value.shape)
+        sigma_net_state_dict["3.weight"] = torch.from_numpy(sigma_weights[64*32:]).reshape(16, 64)
+        
+        # for name, value in color_net_state_dict.items():
+        #     print("value before load ", value.shape)
+        #     shape_before_load = value.shape
+
+        #     if name == "0.weight":
+        #         value = torch.from_numpy(rgb_weights[:64*32]).reshape(64, 32)
+        #         print("color layer ", name," load ", value.shape)
+        #     elif name == "2.weight":
+        #         value = torch.from_numpy(rgb_weights[64*32:64*32+64*64]).reshape(64, 64)
+        #         print("color layer ", name," load ", value.shape)
+        #     elif name == "4.weight":
+        #         value = torch.from_numpy(rgb_weights[64*32+64*64:64*32+64*64+3*64]).reshape(3, 64)
+        #         print("color layer ", name," load ", value.shape)
+        #     shape_after_load = value.shape
+        #     assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
+        #     print("value after load ", value.shape)
+        
+        color_net_state_dict["0.weight"] = torch.from_numpy(rgb_weights[:64*32]).reshape(64, 32)
+        color_net_state_dict["2.weight"] = torch.from_numpy(rgb_weights[64*32:64*32+64*64]).reshape(64, 64)
+        color_net_state_dict["4.weight"] = torch.from_numpy(rgb_weights[64*32+64*64:64*32+64*64+3*64]).reshape(3, 64)
         
         print("hash embedding ", hash_embedding.shape)
         offset = 0
@@ -413,7 +489,6 @@ class NerfDriver:
 
         return directions.reshape(-1, 3)
 
-
     def query(self, input, mlp : MLP):
         input = input.reshape(-1, 19)
         # print("mlp input shape ", input.shape)
@@ -421,6 +496,15 @@ class NerfDriver:
         color, density = out[:, :3], out[:, -1]
         # print("density shape ", density.shape)
         return density, color
+
+
+    @ti.kernel
+    def reset(self):
+        self.depth.fill(0.0)
+        self.opacity.fill(0.0)
+        self.counter[None] = self.N_rays
+        for i, j in ti.ndrange(self.N_rays, 2):
+            self.alive_indices[i*2+j] = i  
 
 
     @ti.func
@@ -518,6 +602,36 @@ class NerfDriver:
             self.N_eff_samples[n] = s
             if s == 0:
                 self.alive_indices[n*2+c_index] = -1
+    
+
+    @ti.kernel
+    def rearange_index(self, B: ti.i32):
+        self.model_launch[None] = 0
+        
+        for i in ti.ndrange(B):
+            if self.run_model_ind[i]:
+                index = ti.atomic_add(self.model_launch[None], 1)
+                self.temp_hit[index] = i
+
+        self.model_launch[None] += 1
+        self.padd_block_network[None] = ((self.model_launch[None]+ block_dim - 1)// block_dim) *block_dim
+        # self.padd_block_composite[None] = ((self.counter[None]+ 128 - 1)// 128) *128
+    
+
+    @ti.kernel
+    def re_order(self, B: ti.i32):
+
+        self.counter[None] = 0
+        c_index = self.current_index[None]
+        n_index = (c_index + 1) % 2
+        self.current_index[None] = n_index
+
+        for i in ti.ndrange(B):
+            alive_temp = self.alive_indices[i*2+c_index]
+            if alive_temp >= 0:
+                index = ti.atomic_add(self.counter[None], 1)
+                self.alive_indices[index*2+n_index] = alive_temp
+
 
     def composite(self, density, color, dists, samples, batch_size):
         density = density.reshape(samples, batch_size)
@@ -533,13 +647,92 @@ class NerfDriver:
 
         color = color * weight[:,:,None]
         return color.sum(dim=0)
+    
+
+    @ti.kernel
+    def composite_test(self, max_samples: ti.i32, T_threshold: data_type):
+        for n in ti.ndrange(self.counter[None]):
+            N_samples = self.N_eff_samples[n]
+            if N_samples != 0:
+                c_index = self.current_index[None]
+                r = self.alive_indices[n*2+c_index]
+
+                T = data_type(1.0 - self.opacity[r])
+
+                start_idx = n * max_samples
+
+                rgb_temp = tf_vec3(0.0)
+                depth_temp = tf_vec1(0.0)
+                opacity_temp = tf_vec1(0.0)
+                out_3_temp = tf_vec3(0.0)
+
+                for s in range(N_samples):
+                    sn = start_idx + s
+                    a = data_type(1.0 - ti.exp(-self.out_1[sn]*self.deltas[sn]))
+                    w = a * T
+
+                    for i in ti.static(range(3)):
+                        out_3_temp[i] = self.out_3[sn, i]
+
+                    rgb_temp += w * out_3_temp
+                    depth_temp[0] += w * self.ts[sn]
+                    opacity_temp[0] += w
+
+                    T *= data_type(1.0 - a)
+
+                    if T <= T_threshold:
+                        self.alive_indices[n*2+c_index] = -1
+                        break
 
 
-    def render(self):
+                self.rgb[r] += rgb_temp
+                self.depth[r] += depth_temp[0]
+                self.opacity[r] += opacity_temp[0]
+
+
+    def render(self, max_samples, T_threshold, use_dof=False, dist_to_focus=0.8, len_dis=0.0):
+        samples = 0
+        self.reset()
         self.ray_intersect()
         print("hits shape check ", self.hits_t.shape)
         print("hits check ", self.hits_t[512][0], self.hits_t[512][1])
-        self.raymarching_generate_samples()
+
+        while samples < max_samples:
+            N_alive = self.counter[None]
+            if N_alive == 0: break
+
+            # how many more samples the number of samples add for each ray
+            N_samples = max(min(self.N_rays//N_alive, 64), self.min_samples)
+            samples += N_samples
+            launch_model_total = N_alive * N_samples
+
+            self.raymarching_generate_samples(N_samples)
+            self.rearange_index(launch_model_total)
+
+            encoded_dir = self.dir_encoder(self.dirs.to_torch())
+            intputs_mlp = torch.cat([self.xyzs.to_torch(), encoded_dir], dim=1).to(device=torch_device)
+            # print("mlp input shape ", intputs_mlp.shape)
+
+            out = self.mlp(intputs_mlp)
+            color, density = out[:, :3], out[:, -1]
+            self.out_1.from_torch(density)
+            self.out_3.from_torch(color)
+            # self.hash_encode()
+            # self.sigma_layer()
+            # self.rgb_layer()
+            # assert -1 == 1
+
+            self.composite_test(N_samples, T_threshold)
+            self.re_order(N_alive)
+    
+        return samples, N_alive, N_samples
+    
+    def write_image(self):
+        rgb_np = self.rgb.to_numpy().reshape(self.res[0], self.res[1], 3)
+        print("rgb_np ", rgb_np)
+        depth_np = self.depth.to_numpy().reshape(self.res[0], self.res[1])
+        plt.imsave('taichi_ngp.png', (rgb_np*255).astype(np.uint8))
+        # plt.imsave('taichi_ngp_depth.png', depth2img(depth_np))
 
     # def render(self, x):
     #     # Render process

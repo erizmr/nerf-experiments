@@ -38,10 +38,7 @@ meta_data_test = load_meta_from_json(set_name + "/" + scene_name + "/transforms_
 device = "cuda"
 scale = 0.5
 N_max = max(image_w, image_h) // 2
-model = NerfDriver(batch_size=BATCH_SIZE, 
-                    N_max=N_max, 
-                    max_samples=MAX_SAMPLES,
-                    scale=scale, 
+model = NerfDriver( scale=scale, 
                     cascades=max(1+int(np.ceil(np.log2(2*scale))), 1),   
                     grid_size=128, 
                     base_res=16, 
@@ -64,8 +61,8 @@ npy_file = "lego.npy"
 
 
 model.load_parameters(model_dir + npy_file, meta_data_train)
-model.render()
-
+samples, N_alive, N_samples = model.render(max_samples=100, T_threshold=1e-4)
+model.write_image()
 
 
 # optimizer = optimizer_fn(model.mlp.parameters(), lr=learning_rate)
