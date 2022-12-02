@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 
 
+def loss_fn(x: torch.Tensor, y: torch.Tensor):
+    return ((x-y)**2).sum()
+
 class SHEncoder(nn.Module):
     def __init__(self, input_dim=3, degree=4):
     
@@ -84,3 +87,85 @@ class SHEncoder(nn.Module):
                         result[..., 24] = self.C4[8] * (xx * (xx - 3 * yy) - yy * (3 * xx - yy))
 
         return result
+
+
+# @ti.func
+# def dot(a, b):
+#   return a.x * b.x + a.y * b.y + a.z * b.z
+
+# @ti.kernel
+# def image_to_data(
+#   input_img : ti.template(),
+#   scaled_image : ti.template(),
+#   input : ti.template(),
+#   output : ti.template(),
+#   fov_w : ti.f32,
+#   fov_h : ti.f32,
+#   world_pos_x : ti.f32,
+#   world_pos_y : ti.f32,
+#   world_pos_z : ti.f32):
+#   for i,j in scaled_image:
+#     scaled_image[i, j] = ti.Vector([0.0, 0.0, 0.0, 0.0])
+#   for i,j in input_img:
+#     scaled_image[i // downscale, j // downscale] += input_img[i, j] / (downscale * downscale * 255)
+#   # for i,j in scaled_image:
+#   #   uv = ti.Vector([(i + 0.5) / image_w, (j + 0.5) / image_h])
+#   #   uv = uv * 2.0 - 1.0
+#   #   l = ti.tan(fov_w * 0.5)
+#   #   t = ti.tan(fov_h * 0.5)
+#   #   uv.x *= l
+#   #   uv.y *= t
+#   #   view_dir = ti.Vector([uv.x, uv.y, 1.0])
+#   #   world_dir = ti.Vector([
+#   #     dot(camera_mtx[0], view_dir),
+#   #     dot(camera_mtx[1], view_dir),
+#   #     dot(camera_mtx[2], view_dir)])
+#   #   input[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([world_pos_x, world_pos_y, world_pos_z, world_dir.x, world_dir.y, world_dir.z])
+#   #   output[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([scaled_image[i, j].x, scaled_image[i, j].y, scaled_image[i, j].z])
+#   for i,j in directions:
+#       view_dir = directions[i, j]
+#       world_dir = ti.Vector([
+#         dot(camera_mtx[0], view_dir),
+#         dot(camera_mtx[1], view_dir),
+#         dot(camera_mtx[2], view_dir)])
+#       input[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([world_pos_x, world_pos_y, world_pos_z, world_dir.x, world_dir.y, world_dir.z])
+#       output[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([scaled_image[i, j].x, scaled_image[i, j].y, scaled_image[i, j].z])
+
+# def get_direction(img_w, img_h, camera_angle_x):
+#     w, h = int(img_w), int(img_h)
+#     fx = 0.5*w/np.tan(0.5*camera_angle_x)
+#     fy = 0.5*h/np.tan(0.5*camera_angle_x)
+#     cx, cy = 0.5*w, 0.5*h
+
+#     x, y = np.meshgrid(
+#         np.arange(w, dtype=np.float32)+ 0.5,
+#         np.arange(h, dtype=np.float32)+ 0.5,
+#         indexing='xy'
+#     )
+
+#     directions = np.stack([(x-cx)/fx, (y-cy)/fy, np.ones_like(x)], -1)
+
+#     return directions.reshape(w, h, 3)
+
+# def generate_data(desc, i):
+#   img = desc["frames"][i]
+#   file_name = set_name + "/" + scene_name + "/" + img["file_path"] + ".png"
+#   npimg = ti.imread(file_name)
+#   input_image.from_numpy(npimg)
+#   mtx = np.array(img["transform_matrix"])
+#   camera_angle_x = float(desc["camera_angle_x"])
+#   directions.from_numpy(get_direction(img_w=int(image_w), img_h=int(image_h), camera_angle_x=camera_angle_x))
+
+#   # To fit ngp_pl convention
+#   mtx[:, 1:3] *= -1 # [right up back] to [right down front]
+#   pose_radius_scale = 1.5
+#   mtx[:, 3] /= np.linalg.norm(mtx[:, 3])/pose_radius_scale
+
+#   camera_mtx.from_numpy(mtx[:3,:3])
+#   ray_o = mtx[:3,-1]
+#   if i == 20:
+#         print("ray o ", ray_o)
+#         print("matrix ", camera_mtx)
+#         # assert -1 == 1
+#   ti.sync()
+#   image_to_data(input_image, scaled_image, input_data, output_data, float(desc["camera_angle_x"]), float(desc["camera_angle_x"]), ray_o[0], ray_o[1], ray_o[2])
