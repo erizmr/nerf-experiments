@@ -550,14 +550,6 @@ class NerfDriver:
 
         return directions.reshape(-1, 3)
 
-    def query(self, input, mlp : MLP):
-        input = input.reshape(-1, 19)
-        # print("mlp input shape ", input.shape)
-        out = mlp(input)
-        color, density = out[:, :3], out[:, -1]
-        # print("density shape ", density.shape)
-        return density, color
-
 
     @ti.kernel
     def reset(self):
@@ -764,22 +756,6 @@ class NerfDriver:
             if alive_temp >= 0:
                 index = ti.atomic_add(self.counter[None], 1)
                 self.alive_indices[index*2+n_index] = alive_temp
-
-
-    def composite(self, density, color, dists, samples, batch_size):
-        density = density.reshape(samples, batch_size)
-        # density = torch.unsqueeze(density, 0).repeat(samples, 1)
-        color = color.reshape(samples, batch_size, 3)
-        # color = torch.unsqueeze(color, 0).repeat(samples, 1, 1)
-
-        # print("density shape ", density.shape, " color shape ", color.shape)
-        # Convert density to alpha
-        alpha = 1.0 - torch.exp(-F.relu(density) * dists)
-        # Composite
-        weight = alpha * torch.cumprod(1.0 - alpha + 1e-10, dim=0)
-
-        color = color * weight[:,:,None]
-        return color.sum(dim=0)
     
 
     @ti.kernel
@@ -814,7 +790,7 @@ class NerfDriver:
                     T *= data_type(1.0 - a)
 
                     if T <= T_threshold:
-                        # self.alive_indices[n*2+c_index] = -1
+                        self.alive_indices[n*2+c_index] = -1
                         break
 
 
@@ -859,15 +835,9 @@ class NerfDriver:
             # # print("inputs mlp ", inputs_mlp.shape, inputs_mlp.dtype)
             out = self.mlp(inputs_mlp)
             color, density = out[:, :3], out[:, -1]
-            # print("density check ", self.out_1[512])
 
             self.density_torch_sparse_to_field(self.padd_block_network[None], density.contiguous())
             self.color_torch_sparse_to_field(self.padd_block_network[None], color.contiguous())
-            # self.out_1.from_torch(density)
-            # self.out_3.from_torch(color)
-
-            # self.sigma_layer()
-            # self.rgb_layer()
 
             self.composite_test(N_samples, T_threshold)
             self.re_order(N_alive)
