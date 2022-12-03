@@ -465,12 +465,15 @@ class NerfDriver:
             if cnt == 0:
                 assert value.shape == (64, 32), f"Torch weight shape {value.shape}, load weight shape (64, 32)"
                 value.data = torch.from_numpy(rgb_weights[:64*32]).reshape(64, 32).to(torch_device)
+                # value.data.fill_(0)
             elif cnt == 1:
                 assert value.shape == (64, 64), f"Torch weight shape {value.shape}, load weight shape (64, 64)"
                 value.data = torch.from_numpy(rgb_weights[64*32:64*32+64*64]).reshape(64, 64).to(torch_device)
+                # value.data.fill_(0)
             elif cnt == 2:
                 assert value.shape == (3, 64), f"Torch weight shape {value.shape}, load weight shape (3, 64)"
                 value.data = torch.from_numpy(rgb_weights[64*32+64*64:64*32+64*64+3*64]).reshape(3, 64).to(torch_device)
+                # value.data.fill_(0)
             cnt += 1
         
         print("hash embedding ", hash_embedding.shape)
@@ -733,99 +736,6 @@ class NerfDriver:
             self.xyzs_embedding[sn, level*2] = local_feature_0
             self.xyzs_embedding[sn, level*2+1] = local_feature_1
 
-    @ti.kernel
-    def sigma_layer(self):
-        ti.loop_config(block_dim=block_dim)
-        for sn in ti.ndrange(self.padd_block_network[None]):
-            tid = sn % block_dim
-            did_launch_num = self.model_launch[None]
-            init_val = tf_vec1(0.0)
-            input = ti.simt.block.SharedArray((32, block_dim), data_type)
-            weight = ti.simt.block.SharedArray((64*32+64*16,), data_type)
-            hid1 = ti.simt.block.SharedArray((64, block_dim), data_type)
-            hid2 = ti.simt.block.SharedArray((16, block_dim), data_type)
-            for i in ti.static(range(sigma_sm_preload)):
-                k = tid*sigma_sm_preload+i
-                weight[k] = self.sigma_weights[k]
-            ti.simt.block.sync()
-
-            if sn < did_launch_num:
-                
-                for i in ti.static(range(32)):
-                    input[i, tid] = self.xyzs_embedding[sn, i]
-
-                for i in range(64):
-                    temp = init_val[0]
-                    for j in ti.static(range(32)):
-                        temp += input[j, tid] * weight[i*32+j]
-
-                    hid1[i, tid] = temp
-                ti.simt.block.sync()
-                
-                for i in range(16):
-                    temp = init_val[0]
-                    for j in ti.static(range(64)):
-                        temp += data_type(ti.max(0.0, hid1[j, tid])) * weight[64*32+i*64+j]
-                    hid2[i, tid] = temp
-                ti.simt.block.sync()
-
-                self.out_1[self.temp_hit[sn]] = data_type(ti.exp(hid2[0, tid]))
-                for i in ti.static(range(16)):
-                    self.final_embedding[sn, i] = hid2[i, tid]
-                
-                ti.simt.block.sync()
-
-    @ti.kernel
-    def rgb_layer(self):
-        ti.loop_config(block_dim=block_dim)
-        for sn in ti.ndrange(self.padd_block_network[None]):
-            ray_id = self.temp_hit[sn]
-            tid = sn % block_dim
-            did_launch_num = self.model_launch[None]
-            init_val = tf_vec1(0.0)
-            weight = ti.simt.block.SharedArray((64*32+64*64+64*4,), data_type)
-            hid1 = ti.simt.block.SharedArray((64, block_dim), data_type)
-            hid2 = ti.simt.block.SharedArray((64, block_dim), data_type)
-            for i in ti.static(range(rgb_sm_preload)):
-                k = tid*rgb_sm_preload+i
-                weight[k] = self.rgb_weights[k]
-            ti.simt.block.sync()
-
-            if sn < did_launch_num:
-                
-                dir_ = self.dirs[ray_id]
-                input = dir_encode_func(dir_)
-
-                for i in ti.static(range(16)):
-                    input[16+i] = self.final_embedding[sn, i]
-
-                for i in range(64):
-                    temp = init_val[0]
-                    for j in ti.static(range(32)):
-                        temp += input[j] * weight[i*32+j]
-
-                    hid1[i, tid] = temp
-                ti.simt.block.sync()
-
-                for i in range(64):
-                    temp = init_val[0]
-                    for j in ti.static(range(64)):
-                        temp += data_type(ti.max(0.0, hid1[j, tid])) * weight[64*32+i*64+j]
-
-                    hid2[i, tid] = temp
-                ti.simt.block.sync()
-
-                for i in ti.static(range(3)):
-                    temp = init_val[0]
-                    for j in ti.static(range(64)):
-                        temp += data_type(ti.max(0.0, hid2[j, tid])) * weight[64*32+64*64+i*64+j]
-
-                    hid1[i, tid] = temp
-                ti.simt.block.sync()
-
-                for i in ti.static(range(3)):
-                    self.out_3[self.temp_hit[sn], i] = data_type(1 / (1 + ti.exp(-hid1[i, tid])))
-                ti.simt.block.sync()
 
     @ti.kernel
     def rearange_index(self, B: ti.i32):
@@ -904,7 +814,7 @@ class NerfDriver:
                     T *= data_type(1.0 - a)
 
                     if T <= T_threshold:
-                        self.alive_indices[n*2+c_index] = -1
+                        # self.alive_indices[n*2+c_index] = -1
                         break
 
 
@@ -913,8 +823,8 @@ class NerfDriver:
                 self.opacity[r] += opacity_temp[0]
     
     @ti.kernel
-    def density_torch_sparse_to_field(self, density: ti.types.ndarray()):
-        for i in density:
+    def density_torch_sparse_to_field(self, size: int, density: ti.types.ndarray()):
+        for i in range(size):
             self.out_1[self.temp_hit[i]] = density[i]
     
     @ti.kernel
@@ -939,24 +849,9 @@ class NerfDriver:
             samples += N_samples
             # print("samples check ", samples, " ", N_samples)
             launch_model_total = N_alive * N_samples
-
+            print(f"samples: {samples}, N_alive: {N_alive}, N_samples: {N_samples}")
             self.raymarching_generate_samples(N_samples)
-            # print("ray marching output check ", self.xyzs)
             self.rearange_index(launch_model_total)
-
-            # encoded_dir = self.dir_encoder(self.dirs.to_torch())
-
-            # print("hash encode input check ", self.xyzs[512])
-            # # normalize to [0, 1], before is [-0.5, 0.5]
-            # intputs_mlp = torch.cat([self.xyzs.to_torch() + 0.5, encoded_dir], dim=1).to(device=torch_device)
-            # # print("mlp input shape ", intputs_mlp.shape)
-
-            # out = self.mlp(intputs_mlp)
-            # color, density = out[:, :3], out[:, -1]
-            # self.out_1.from_torch(density)
-            # self.out_3.from_torch(color)
-            # print("density check ", self.out_1[512])
-
             self.hash_encode()
 
             encoded_dir = self.dir_encoder(self.dirs.to_torch())
@@ -964,10 +859,10 @@ class NerfDriver:
             # # print("inputs mlp ", inputs_mlp.shape, inputs_mlp.dtype)
             out = self.mlp(inputs_mlp)
             color, density = out[:, :3], out[:, -1]
-            print("density check ", self.out_1[512])
+            # print("density check ", self.out_1[512])
 
-            self.density_torch_sparse_to_field(density.contiguous())
-            self.color_torch_sparse_to_field(color.shape[0], color.contiguous())
+            self.density_torch_sparse_to_field(self.padd_block_network[None], density.contiguous())
+            self.color_torch_sparse_to_field(self.padd_block_network[None], color.contiguous())
             # self.out_1.from_torch(density)
             # self.out_3.from_torch(color)
 

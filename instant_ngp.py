@@ -6,7 +6,7 @@ import time
 from instant_ngp_models import NerfDriver
 from instant_ngp_utils import loss_fn
 
-ti.init(arch=ti.cuda, packed=True, device_memory_GB=8)
+ti.init(arch=ti.cuda, debug=False, packed=True, device_memory_GB=2)
 
 torch.set_default_dtype(torch.float16)
 
@@ -54,14 +54,6 @@ np_type = np.float16
 model_dir = "./npy_models/"
 npy_file = "lego.npy"
 
-# input_image = ti.Vector.field((4), dtype=ti.f32, shape=(int(image_w) * downscale, int(image_h) * downscale))
-# input_data = ti.Vector.field((6), dtype=ti.f32, shape=(int(image_w * image_h)))
-# output_data = ti.Vector.field((3), dtype=ti.f32, shape=(int(image_w * image_h)))
-# scaled_image = ti.Vector.field((4), dtype=ti.f32, shape=(int(image_w), int(image_h)))
-# directions = ti.Vector.field(3, dtype=ti.f32, shape=(int(image_w), int(image_h)))
-# density_bitfield = ti.field(ti.uint8, shape=(CASCADES*GRID_SIZE**3//8))
-# camera_mtx = ti.Vector.field(3, dtype=ti.f32, shape=(3))
-
 model.hash_table_init()
 model.load_model(model_dir + npy_file)
 
@@ -70,7 +62,7 @@ model.load_parameters(model_dir + npy_file, meta_data_train)
 t = time.time()
 samples, N_alive, N_samples = model.render(max_samples=100, T_threshold=1e-4)
 model.write_image()
-print(f"samples: {samples}, N_alive: {N_alive}, N_samples: {N_samples}")
+# print(f"samples: {samples}, N_alive: {N_alive}, N_samples: {N_samples}")
 print(f'Render time: {1000*(time.time()-t):.2f} ms')
 
 
