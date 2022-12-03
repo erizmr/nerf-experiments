@@ -10,6 +10,7 @@ from matplotlib import pyplot as plt
 from taichi.math import ivec2, ivec3
 from math_utils import ray_aabb_intersection
 from instant_ngp_utils import SHEncoder
+from taichi.math import uvec3, vec3, vec2
 
 torch_device = torch.device("cuda:0")
 
@@ -190,10 +191,11 @@ class MLP(nn.Module):
         n_parameters = 0
         # Sigma net
         sigma_output_size = 16 # 1 sigma + 15 features for color net
-        sigma_layers.append(self.hash_encoding_module)
+        # sigma_layers.append(self.hash_encoding_module)
         sigma_layers.append(nn.Linear(sigma_input_size, hidden_size, bias=False))
         sigma_layers.append(nn.ReLU(inplace=True))
         sigma_layers.append(nn.Linear(hidden_size, sigma_output_size, bias=False))
+        # sigma_layers.append(nn.ReLU(inplace=True))
 
         n_parameters += sigma_input_size * hidden_size + hidden_size * sigma_output_size
         self.sigma_net = nn.Sequential(*sigma_layers).to(torch_device)
@@ -220,9 +222,11 @@ class MLP(nn.Module):
 
     def forward(self, x):
         # x [batch, 3+16] 3 for position, 16 for encoded directions
-        input_pos, input_dir = x[:,:3], x[:,3:]
+        input_dir, input_pos = x[:,:16], x[:,16:]
+        # print(input_pos.shape, input_pos.dtype)
         out = self.sigma_net(input_pos)
         sigma, geo_feat = out[..., 0], out[..., 1:]
+        sigma = torch.exp(sigma)
         color_input = torch.cat([input_dir, out], dim=-1)
         color = self.color_net(color_input)
         return torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
@@ -244,6 +248,8 @@ tf_vec1 = ti.types.vector(1, dtype=data_type)
 tf_vec2 = ti.types.vector(2, dtype=data_type)
 tf_mat1x3 = ti.types.matrix(1, 3, dtype=data_type)
 tf_index_temp = ti.types.vector(8, dtype=ti.i32)
+
+MAX_SAMPLES = 1024
 NEAR_DISTANCE = 0.01
 
 SQRT3 = 1.7320508075688772
@@ -268,6 +274,53 @@ def __expand_bits(v):
 def __morton3D(xyz):
     xyz = __expand_bits(xyz)
     return xyz[0] | (xyz[1] << 1) | (xyz[2] << 2)
+
+
+@ti.func
+def fast_hash(pos_grid_local):
+    result = ti.uint32(0)
+    primes = uvec3(ti.uint32(1), ti.uint32(2654435761), ti.uint32(805459861))
+    for i in ti.static(range(3)):
+        result ^= ti.uint32(pos_grid_local[i]) * primes[i]
+    return result
+
+@ti.func
+def under_hash(pos_grid_local, resolution):
+    result = ti.uint32(0)
+    stride = ti.uint32(1)
+    for i in ti.static(range(3)):
+        result += ti.uint32(pos_grid_local[i] * stride)
+        stride *= resolution
+    return result
+
+@ti.func
+def grid_pos2hash_index(indicator, pos_grid_local, resolution, map_size):
+    hash_result = ti.uint32(0)
+    if indicator == 1:
+        hash_result = under_hash(pos_grid_local, resolution)
+    else:
+        hash_result = fast_hash(pos_grid_local)
+
+    return hash_result % map_size
+
+
+@ti.func
+def dir_encode_func(dir_):
+    input = tf_vec32(0.0)
+    dir = dir_/dir_.norm()
+    x = dir[0]; y = dir[1]; z = dir[2]
+    xy= x*y; xz= x*z; yz= y*z; x2= x*x; y2= y*y; z2= z*z
+    
+    temp = 0.28209479177387814
+    input[0] = data_type(temp); input[1] = data_type(-0.48860251190291987*y); input[2] = data_type(0.48860251190291987*z)
+    input[3] = data_type(-0.48860251190291987*x); input[4] = data_type(1.0925484305920792*xy); input[5] = data_type(-1.0925484305920792*yz)
+    input[6] = data_type(0.94617469575755997*z2 - 0.31539156525251999); input[7] = data_type(-1.0925484305920792*xz)
+    input[8] = data_type(0.54627421529603959*x2 - 0.54627421529603959*y2); input[9] = data_type(0.59004358992664352*y*(-3.0*x2 + y2))
+    input[10] = data_type(2.8906114426405538*xy*z); input[11] = data_type(0.45704579946446572*y*(1.0 - 5.0*z2))
+    input[12] = data_type(0.3731763325901154*z*(5.0*z2 - 3.0)); input[13] = data_type(0.45704579946446572*x*(1.0 - 5.0*z2))
+    input[14] = data_type(1.4453057213202769*z*(x2 - y2)); input[15] = data_type(0.59004358992664352*x*(-x2 + 3.0*y2))
+
+    return input
 
 
 @ti.kernel
@@ -384,8 +437,6 @@ class NerfDriver:
     # Load parameters
     def load_parameters(self, model_path, meta_data):
         print('Loading model from {}'.format(model_path))
-        sigma_net_state_dict = self.mlp.sigma_net.state_dict()
-        color_net_state_dict = self.mlp.color_net.state_dict()
         hash_encoding_module = self.mlp.grid_encoding
 
         # Load pre-trained model parameters
@@ -394,47 +445,33 @@ class NerfDriver:
         rgb_weights = model['model.rgb_net.params'].astype(np_type)
         hash_embedding = model['model.xyz_encoder.params'].astype(np_type)
 
-        # for name, value in sigma_net_state_dict.items():
-        #     print("value before load ", value.shape)
-        #     shape_before_load = value.shape
-        #     if name == "1.weight":
-        #         value = torch.from_numpy(sigma_weights[:64*32]).reshape(64, 32)
-        #         print("sigma layer ", name," load ", value.shape)
-        #     elif name == "3.weight":
-        #         value = torch.from_numpy(sigma_weights[64*32:]).reshape(16, 64)
-        #         print("sigma layer ", name," load ", value.shape)
-        #     shape_after_load = value.shape
-        #     assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
-        #     print("value after load ", value.shape)
-        old_val = sigma_net_state_dict["1.weight"].cpu().numpy().astype(np_type)
+
+        old_val = self.mlp.sigma_net.state_dict()["0.weight"].cpu().numpy().astype(np_type)
         print("old val ", old_val)
-        sigma_net_state_dict["1.weight"] = torch.from_numpy(sigma_weights[:64*32]).reshape(64, 32)
-        new_val = sigma_net_state_dict["1.weight"].cpu().numpy().astype(np_type)
+
+        cnt = 0
+        for value in self.mlp.sigma_net.parameters():
+            if cnt == 0:
+                value.data = torch.from_numpy(sigma_weights[:64*32]).reshape(64, 32).to(torch_device)
+            elif cnt == 1:
+                value.data = torch.from_numpy(sigma_weights[64*32:]).reshape(16, 64).to(torch_device)
+            cnt += 1
+        new_val = self.mlp.sigma_net.state_dict()["0.weight"].cpu().numpy().astype(np_type)
         print("new val ", new_val)
         assert not np.allclose(old_val, new_val, 1e-5)
-
-        sigma_net_state_dict["3.weight"] = torch.from_numpy(sigma_weights[64*32:]).reshape(16, 64)
         
-        # for name, value in color_net_state_dict.items():
-        #     print("value before load ", value.shape)
-        #     shape_before_load = value.shape
-
-        #     if name == "0.weight":
-        #         value = torch.from_numpy(rgb_weights[:64*32]).reshape(64, 32)
-        #         print("color layer ", name," load ", value.shape)
-        #     elif name == "2.weight":
-        #         value = torch.from_numpy(rgb_weights[64*32:64*32+64*64]).reshape(64, 64)
-        #         print("color layer ", name," load ", value.shape)
-        #     elif name == "4.weight":
-        #         value = torch.from_numpy(rgb_weights[64*32+64*64:64*32+64*64+3*64]).reshape(3, 64)
-        #         print("color layer ", name," load ", value.shape)
-        #     shape_after_load = value.shape
-        #     assert shape_before_load == shape_after_load, "Shape before and after load mismatch."
-        #     print("value after load ", value.shape)
-        
-        color_net_state_dict["0.weight"] = torch.from_numpy(rgb_weights[:64*32]).reshape(64, 32)
-        color_net_state_dict["2.weight"] = torch.from_numpy(rgb_weights[64*32:64*32+64*64]).reshape(64, 64)
-        color_net_state_dict["4.weight"] = torch.from_numpy(rgb_weights[64*32+64*64:64*32+64*64+3*64]).reshape(3, 64)
+        cnt = 0
+        for value in self.mlp.color_net.parameters():
+            if cnt == 0:
+                assert value.shape == (64, 32), f"Torch weight shape {value.shape}, load weight shape (64, 32)"
+                value.data = torch.from_numpy(rgb_weights[:64*32]).reshape(64, 32).to(torch_device)
+            elif cnt == 1:
+                assert value.shape == (64, 64), f"Torch weight shape {value.shape}, load weight shape (64, 64)"
+                value.data = torch.from_numpy(rgb_weights[64*32:64*32+64*64]).reshape(64, 64).to(torch_device)
+            elif cnt == 2:
+                assert value.shape == (3, 64), f"Torch weight shape {value.shape}, load weight shape (3, 64)"
+                value.data = torch.from_numpy(rgb_weights[64*32+64*64:64*32+64*64+3*64]).reshape(3, 64).to(torch_device)
+            cnt += 1
         
         print("hash embedding ", hash_embedding.shape)
         offset = 0
@@ -471,6 +508,27 @@ class NerfDriver:
         print("pose matrix check ", self.pose)
         print("directions check ", directions[1024,:,:])
         # assert -1 == 1
+    
+    def load_model(self, model_path):
+        print('Loading model from {}'.format(model_path))
+        model = np.load(model_path, allow_pickle=True).item()
+        # model = torch.load(model_path, map_location='cpu')['state_dict']
+        self.hash_embedding.from_numpy(model['model.xyz_encoder.params'].astype(np_type))
+        self.sigma_weights.from_numpy(model['model.xyz_sigmas.params'].astype(np_type))
+        self.rgb_weights.from_numpy(model['model.rgb_net.params'].astype(np_type))
+
+        self.density_bitfield.from_numpy(model['model.density_bitfield'])
+
+        self.pose.from_numpy(model['poses'][20].astype(np_type))
+        if self.res[0] != 800 or self.res[1] != 800:
+            directions = self.get_direction(model['camera_angle_x'])[:, None, :].astype(np_type)
+            print("camera angle x ", model['camera_angle_x'])
+        else:
+            directions = model['directions'][:, None, :].astype(np_type)
+        
+        print("pose matrix check ", self.pose)
+        print("directions check ", directions[1024,:,:])
+        self.directions.from_numpy(directions)
     
 
     def get_direction(self, camera_angle_x):
@@ -524,6 +582,7 @@ class NerfDriver:
 
     @ti.kernel
     def ray_intersect(self):
+        ti.block_local(self.pose)
         for i in self.directions:
             c2w = self.pose[None]
             mat_result = self.directions[i] @ c2w[:, :3].transpose()
@@ -602,7 +661,171 @@ class NerfDriver:
             self.N_eff_samples[n] = s
             if s == 0:
                 self.alive_indices[n*2+c_index] = -1
-    
+
+    def hash_table_init(self):
+        print(f'GridEncoding: base resolution: {self.base_res}, log scale per level:{self.per_level_scales:.5f} feature numbers per level: {2} maximum parameters per level: {self.max_params} level: {self.level}')
+        offset = 0
+        for i in range(self.level):
+            resolution = int(np.ceil(self.base_res * np.exp(i*np.log(self.per_level_scales)) - 1.0)) + 1
+            params_in_level = resolution ** 3
+            params_in_level = int(resolution ** 3) if params_in_level % 8 == 0 else int((params_in_level + 8 - 1) / 8) * 8
+            params_in_level = min(self.max_params, params_in_level)
+            self.offsets[i] = offset
+            self.hash_map_sizes[i] = params_in_level
+            self.hash_map_indicator[i] = 1 if resolution ** 3 <= params_in_level else 0
+            offset += params_in_level
+            print(f"level: {i}, resolution: {resolution}, table size: {params_in_level}")
+
+    @ti.kernel
+    def hash_encode(self):
+        # get hash table embedding
+        ti.loop_config(block_dim=16)
+        for sn, level in ti.ndrange(self.model_launch[None], 16):
+            # normalize to [0, 1], before is [-0.5, 0.5]
+            xyz = self.xyzs[self.temp_hit[sn]] + 0.5
+            offset = self.offsets[level] * 2
+            indicator = self.hash_map_indicator[level]
+            map_size = self.hash_map_sizes[level]
+
+            init_val0 = tf_vec1(0.0)
+            init_val1 = tf_vec1(1.0)
+            local_feature_0 = init_val0[0]
+            local_feature_1 = init_val0[0]
+
+            index_temp = tf_index_temp(0)
+            w_temp = tf_vec8(0.0)
+            hash_temp_1 = tf_vec8(0.0)
+            hash_temp_2 = tf_vec8(0.0)
+
+            scale = self.base_res * ti.exp(level*ti.log(self.per_level_scales)) - 1.0
+            resolution = ti.cast(ti.ceil(scale), ti.uint32) + 1
+
+            pos = xyz * scale + 0.5
+            pos_grid_uint = ti.cast(ti.floor(pos), ti.uint32)
+            pos -= pos_grid_uint
+            # pos_grid_uint = ti.cast(pos_grid, ti.uint32)
+
+            for idx in ti.static(range(8)):
+                # idx_uint = ti.cast(idx, ti.uint32)
+                w = init_val1[0]
+                pos_grid_local = uvec3(0)
+
+                for d in ti.static(range(3)):
+                    if (idx & (1 << d)) == 0:
+                        pos_grid_local[d] = pos_grid_uint[d]
+                        w *= data_type(1 - pos[d])
+                    else:
+                        pos_grid_local[d] = pos_grid_uint[d] + 1
+                        w *= data_type(pos[d])
+
+                index = ti.int32(grid_pos2hash_index(indicator, pos_grid_local, resolution, map_size))
+                index_temp[idx] = offset+index*2
+                w_temp[idx] = w
+
+            for idx in ti.static(range(8)):
+                hash_temp_1[idx] = self.hash_embedding[index_temp[idx]]
+                hash_temp_2[idx] = self.hash_embedding[index_temp[idx]+1]
+
+            for idx in ti.static(range(8)):
+                local_feature_0 += data_type(w_temp[idx] * hash_temp_1[idx])
+                local_feature_1 += data_type(w_temp[idx] * hash_temp_2[idx])
+
+            self.xyzs_embedding[sn, level*2] = local_feature_0
+            self.xyzs_embedding[sn, level*2+1] = local_feature_1
+
+    @ti.kernel
+    def sigma_layer(self):
+        ti.loop_config(block_dim=block_dim)
+        for sn in ti.ndrange(self.padd_block_network[None]):
+            tid = sn % block_dim
+            did_launch_num = self.model_launch[None]
+            init_val = tf_vec1(0.0)
+            input = ti.simt.block.SharedArray((32, block_dim), data_type)
+            weight = ti.simt.block.SharedArray((64*32+64*16,), data_type)
+            hid1 = ti.simt.block.SharedArray((64, block_dim), data_type)
+            hid2 = ti.simt.block.SharedArray((16, block_dim), data_type)
+            for i in ti.static(range(sigma_sm_preload)):
+                k = tid*sigma_sm_preload+i
+                weight[k] = self.sigma_weights[k]
+            ti.simt.block.sync()
+
+            if sn < did_launch_num:
+                
+                for i in ti.static(range(32)):
+                    input[i, tid] = self.xyzs_embedding[sn, i]
+
+                for i in range(64):
+                    temp = init_val[0]
+                    for j in ti.static(range(32)):
+                        temp += input[j, tid] * weight[i*32+j]
+
+                    hid1[i, tid] = temp
+                ti.simt.block.sync()
+                
+                for i in range(16):
+                    temp = init_val[0]
+                    for j in ti.static(range(64)):
+                        temp += data_type(ti.max(0.0, hid1[j, tid])) * weight[64*32+i*64+j]
+                    hid2[i, tid] = temp
+                ti.simt.block.sync()
+
+                self.out_1[self.temp_hit[sn]] = data_type(ti.exp(hid2[0, tid]))
+                for i in ti.static(range(16)):
+                    self.final_embedding[sn, i] = hid2[i, tid]
+                
+                ti.simt.block.sync()
+
+    @ti.kernel
+    def rgb_layer(self):
+        ti.loop_config(block_dim=block_dim)
+        for sn in ti.ndrange(self.padd_block_network[None]):
+            ray_id = self.temp_hit[sn]
+            tid = sn % block_dim
+            did_launch_num = self.model_launch[None]
+            init_val = tf_vec1(0.0)
+            weight = ti.simt.block.SharedArray((64*32+64*64+64*4,), data_type)
+            hid1 = ti.simt.block.SharedArray((64, block_dim), data_type)
+            hid2 = ti.simt.block.SharedArray((64, block_dim), data_type)
+            for i in ti.static(range(rgb_sm_preload)):
+                k = tid*rgb_sm_preload+i
+                weight[k] = self.rgb_weights[k]
+            ti.simt.block.sync()
+
+            if sn < did_launch_num:
+                
+                dir_ = self.dirs[ray_id]
+                input = dir_encode_func(dir_)
+
+                for i in ti.static(range(16)):
+                    input[16+i] = self.final_embedding[sn, i]
+
+                for i in range(64):
+                    temp = init_val[0]
+                    for j in ti.static(range(32)):
+                        temp += input[j] * weight[i*32+j]
+
+                    hid1[i, tid] = temp
+                ti.simt.block.sync()
+
+                for i in range(64):
+                    temp = init_val[0]
+                    for j in ti.static(range(64)):
+                        temp += data_type(ti.max(0.0, hid1[j, tid])) * weight[64*32+i*64+j]
+
+                    hid2[i, tid] = temp
+                ti.simt.block.sync()
+
+                for i in ti.static(range(3)):
+                    temp = init_val[0]
+                    for j in ti.static(range(64)):
+                        temp += data_type(ti.max(0.0, hid2[j, tid])) * weight[64*32+64*64+i*64+j]
+
+                    hid1[i, tid] = temp
+                ti.simt.block.sync()
+
+                for i in ti.static(range(3)):
+                    self.out_3[self.temp_hit[sn], i] = data_type(1 / (1 + ti.exp(-hid1[i, tid])))
+                ti.simt.block.sync()
 
     @ti.kernel
     def rearange_index(self, B: ti.i32):
@@ -688,7 +911,17 @@ class NerfDriver:
                 self.rgb[r] += rgb_temp
                 self.depth[r] += depth_temp[0]
                 self.opacity[r] += opacity_temp[0]
-
+    
+    @ti.kernel
+    def density_torch_sparse_to_field(self, density: ti.types.ndarray()):
+        for i in density:
+            self.out_1[self.temp_hit[i]] = density[i]
+    
+    @ti.kernel
+    def color_torch_sparse_to_field(self, batch_size: int, color: ti.types.ndarray()):
+        for i in range(batch_size):
+            for j in ti.static(range(3)):
+                self.out_3[self.temp_hit[i], j] = color[i, j]
 
     def render(self, max_samples, T_threshold, use_dof=False, dist_to_focus=0.8, len_dis=0.0):
         samples = 0
@@ -704,23 +937,42 @@ class NerfDriver:
             # how many more samples the number of samples add for each ray
             N_samples = max(min(self.N_rays//N_alive, 64), self.min_samples)
             samples += N_samples
+            # print("samples check ", samples, " ", N_samples)
             launch_model_total = N_alive * N_samples
 
             self.raymarching_generate_samples(N_samples)
+            # print("ray marching output check ", self.xyzs)
             self.rearange_index(launch_model_total)
 
-            encoded_dir = self.dir_encoder(self.dirs.to_torch())
-            intputs_mlp = torch.cat([self.xyzs.to_torch(), encoded_dir], dim=1).to(device=torch_device)
-            # print("mlp input shape ", intputs_mlp.shape)
+            # encoded_dir = self.dir_encoder(self.dirs.to_torch())
 
-            out = self.mlp(intputs_mlp)
+            # print("hash encode input check ", self.xyzs[512])
+            # # normalize to [0, 1], before is [-0.5, 0.5]
+            # intputs_mlp = torch.cat([self.xyzs.to_torch() + 0.5, encoded_dir], dim=1).to(device=torch_device)
+            # # print("mlp input shape ", intputs_mlp.shape)
+
+            # out = self.mlp(intputs_mlp)
+            # color, density = out[:, :3], out[:, -1]
+            # self.out_1.from_torch(density)
+            # self.out_3.from_torch(color)
+            # print("density check ", self.out_1[512])
+
+            self.hash_encode()
+
+            encoded_dir = self.dir_encoder(self.dirs.to_torch())
+            inputs_mlp = torch.cat([encoded_dir, self.xyzs_embedding.to_torch()], dim=1).to(device=torch_device)
+            # # print("inputs mlp ", inputs_mlp.shape, inputs_mlp.dtype)
+            out = self.mlp(inputs_mlp)
             color, density = out[:, :3], out[:, -1]
-            self.out_1.from_torch(density)
-            self.out_3.from_torch(color)
-            # self.hash_encode()
+            print("density check ", self.out_1[512])
+
+            self.density_torch_sparse_to_field(density.contiguous())
+            self.color_torch_sparse_to_field(color.shape[0], color.contiguous())
+            # self.out_1.from_torch(density)
+            # self.out_3.from_torch(color)
+
             # self.sigma_layer()
             # self.rgb_layer()
-            # assert -1 == 1
 
             self.composite_test(N_samples, T_threshold)
             self.re_order(N_alive)
@@ -729,7 +981,6 @@ class NerfDriver:
     
     def write_image(self):
         rgb_np = self.rgb.to_numpy().reshape(self.res[0], self.res[1], 3)
-        print("rgb_np ", rgb_np)
         depth_np = self.depth.to_numpy().reshape(self.res[0], self.res[1])
         plt.imsave('taichi_ngp.png', (rgb_np*255).astype(np.uint8))
         # plt.imsave('taichi_ngp_depth.png', depth2img(depth_np))
